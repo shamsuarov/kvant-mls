@@ -1,0 +1,4 @@
+/target
+**/*.rs.bk
+# Cargo.lock IS committed (pin OpenMLS/libcrux/X-Wing exactly for reproducible builds).
+/generated

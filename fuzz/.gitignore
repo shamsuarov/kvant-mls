@@ -1,0 +1,10 @@
+# cargo-fuzz build + run artifacts (keep the seed corpus/ under version control)
+/target
+/Cargo.lock
+artifacts/
+coverage/
+corpus/*/crash-*
+corpus/*/leak-*
+corpus/*/timeout-*
+# campaign-grown corpus (500MB+, 200k files) — archive separately, do not commit
+corpus/

@@ -1,0 +1,83 @@
+# kvant-mls Tier-1 fuzz crate (cargo-fuzz / libFuzzer). Deserialize-only targets — the cheapest,
+# highest-bug-density surface (the auditor's Tier-1): our own identity parser + OpenMLS WIRE
+# deserialization (MlsMessageIn covers Welcome/Commit/Application/GroupInfo bodies; KeyPackageIn is the
+# Add path). Tier-2 (stateful, needs a valid group fixture) is a SEPARATE crate, added later.
+#
+# Standalone workspace (empty [workspace]) so it does not perturb the parent crate's Android build; it
+# path-depends on kvant-mls with the `fuzzing` feature for the private decode_identity parser.
+
+[package]
+name = "kvant-mls-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# MUST pin the same OpenMLS as the parent (=0.9.0-rc.1, Route-2 bump 73f9624) so the In types are the
+# SAME compiled types Cargo unifies — a version skew would link two openmls instances. The pq feature
+# mirrors the parent (X-Wing 0x004D moved behind it in 0.9; feature unification would enable it anyway
+# via the parent, pinned here explicitly for clarity).
+openmls = { version = "=0.9.0-rc.1", features = ["draft-ietf-mls-pq-ciphersuites"] }
+
+[dependencies.kvant-mls]
+path = ".."
+features = ["fuzzing"]
+
+# 🔴 Bake the auditor's required build hardening into EVERY fuzz build (libFuzzer builds release):
+#   overflow-checks → an integer overflow in a vector-count/length computation PANICS (libFuzzer catches)
+#                     instead of silently wrapping past a bound.
+#   debug-assertions → OpenMLS/tls_codec internal debug_asserts fire as crashes, not no-ops.
+#   debug = 1        → line tables so ASAN/libFuzzer crash reports symbolicate.
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true
+
+[[bin]]
+name = "decode_identity"
+path = "fuzz_targets/decode_identity.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mls_message_in"
+path = "fuzz_targets/mls_message_in.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "key_package_in"
+path = "fuzz_targets/key_package_in.rs"
+test = false
+doc = false
+bench = false
+
+# ---- Tier-2 (stateful) — exercise the VERIFIED spike over a valid group fixture (libcrux runs) ----
+[[bin]]
+name = "process_stateful"   # Target A: mutated-valid message → process_message (primary, libcrux-dense)
+path = "fuzz_targets/process_stateful.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "op_sequence"        # Target B: program of ops over 3 members (consistency + PCS invariants)
+path = "fuzz_targets/op_sequence.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "emit_seeds"         # one-shot Target-A seed emitter (NOT a fuzz target — a plain main)
+path = "fuzz_targets/emit_seeds.rs"
+test = false
+doc = false
+bench = false

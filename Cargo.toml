@@ -1,0 +1,79 @@
+[package]
+name = "kvant-mls"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# M1 SPIKE crate: prove OpenMLS + libcrux (X-Wing 0x004D) cross-compiles & runs on Android ARM,
+# measure real Commit/Welcome bytes + latency on-device, and demonstrate KSE1 storage-at-rest.
+# NOT membership integration (that's M2). cdylib → a .so packaged into an .aar.
+
+[lib]
+# cdylib → the .so packaged into the .aar (Android). rlib → so the host fuzz crate (cargo-fuzz /
+# libFuzzer) can link kvant-mls as a Rust dependency and drive its raw parsers. The extra rlib artifact
+# does not affect the Android cdylib build. staticlib → the .a linked into the iOS .xcframework
+# (Apple requires static linking for App Store distribution of Rust code); no effect on Android.
+crate-type = ["cdylib", "rlib", "staticlib"]
+name = "kvant_mls"
+
+[features]
+# Tier-1 fuzzing surface (off by default). Exposes the raw deserialize parsers (lib.rs::fuzz_api) so the
+# fuzz crate can call them OUTSIDE the Contract-1 catch_unwind guard — a panic/UB/OOB must reach the
+# sanitizer, not be swallowed into a typed error. Never enabled for the production cdylib.
+fuzzing = []
+
+[dependencies]
+# EXACT compatible family for openmls 0.8.1 (from docs.rs openmls 0.8.1 deps — verified by user).
+# X-Wing (MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519, 0x004D, PR #1546) landed AFTER the 0.6.0
+# crates.io artifact and ships in 0.8, with the new StorageProvider trait (#1565) + the libcrux/hpke
+# security fixes (GHSA-435g-fcv3-8j26 / GHSA-g433-pq76-6cmf).
+# Route-2 provider bump (2026-08-05): 0.9.0-rc.1 family — closes RUSTSEC-2026-0073/-0124/-0075
+# (libcrux poly1305/chacha20poly1305/ed25519 HIGHs that 0.3.1 hard-pinned; see SECURITY-NOTES.md).
+# Exact `=` pins on the rc family for reproducibility; move to final 0.9.0 when released.
+# 0.9 moved X-Wing 0x004D behind the `draft-ietf-mls-pq-ciphersuites` feature (same name, same code
+# point 0x004D, same "X-WING KEM draft-01" wire) — enable it on openmls (forwards to traits/storage)
+# and on the provider (forwards to its own traits/memory deps).
+openmls = { version = "=0.9.0-rc.1", features = ["draft-ietf-mls-pq-ciphersuites"] }
+openmls_traits = "=0.6.0-rc.1"
+# libcrux crypto provider — REQUIRED for X-Wing 0x004D (NOT openmls_rust_crypto). libcrux-on-ARM
+# proven in M1 (portable + NEON paths); re-verified by the aarch64 cross-compile after this bump.
+openmls_libcrux_crypto = { version = "=0.4.0-rc.1", features = ["draft-ietf-mls-pq-ciphersuites"] }
+openmls_memory_storage = "=0.6.0-rc.1"   # in-memory StorageProvider for the spike (KSE1 seals its export)
+openmls_basic_credential = "=0.6.0-rc.1" # BasicCredential + SignatureKeyPair (moved out of core in 0.8)
+tls_codec = "0.5"
+uniffi = { version = "0.28", features = ["cli"] }   # "cli" → in-crate uniffi-bindgen (version-matched)
+# KSE1 at-rest envelope — same AEAD the app uses (ChaCha20-Poly1305, RFC 8439).
+chacha20poly1305 = "0.10"
+rand = "0.8"
+thiserror = "2"
+# KAT (Contract): exercise the PORTABLE ML-KEM path directly on-device (pinned-vector correctness),
+# since aarch64 takes a DIFFERENT code path than the AVX2 CI/audits. Pin to the version the provider
+# family locks (libcrux-kem 0.0.9 → ml-kem =0.0.10). 0.0.8→0.0.10 verified byte-identical on host
+# (pk c12e9e39… / ss 78dbb52f…); on-device KAT re-test on both SoC pending (device session).
+libcrux-ml-kem = "=0.0.10"
+# D1 device-KAT runner vectors ONLY (src/bin/kat.rs): direct handles on the SAME crates (exact
+# versions already in Cargo.lock via openmls_libcrux_crypto — the pins match the lock, so the lock
+# is unchanged) so the on-device gate covers the 4 HIGH-fix code paths (RFC 8439 AEAD incl. the
+# poly1305 tag + no-panic edges, RFC 8032 sign/verify) — not just ML-KEM. Not used by the lib.
+libcrux-chacha20poly1305 = "=0.0.9"
+libcrux-ed25519 = "=0.0.9"
+sha2 = "0.10"   # KAT: hash pk/ss to pin the portable-path output against the host (AVX2) reference
+# M2 AS-callback trust root: Ed25519 verify for the C3-LINKED device-cert chain (byte-exact port of
+# crypto-core/devicecert.js). verify_strict = RFC 8032 canonical, matches @noble's strict verify.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+# M2 Contract-2: encrypting StorageProvider mirrors MemoryStorage's serde_json value encoding, then
+# KSE1-seals each value before it touches the backing store (no plaintext at rest by construction).
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+# A-5: native Argon2id (RFC 9106) for the app-lock passcode verifier — pure Rust (RustCrypto), no
+# password-hash string layer needed (pinkdf.js keeps its own self-describing record format).
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+
+# Contract 1 (FFI panic boundary): force panic=unwind so uniffi's catch_unwind actually catches a
+# panic (→ typed Kotlin exception, fail-closed) instead of aborting the process. abort would let a
+# malformed Commit/Welcome from A2 crash the client (DoS). Correctness > the tiny size win of abort.
+[profile.release]
+panic = "unwind"
+
+[profile.dev]
+panic = "unwind"
