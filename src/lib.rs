@@ -26,6 +26,9 @@ mod client;
 // shares only the .so + uniffi scaffolding; no MLS/KSE1 logic is touched by it.
 mod argon2kdf;
 
+// A-CRASH-FIX §2: паника Rust обязана оставить след БЕЗ adb. Разбор — в шапке panichook.rs.
+mod panichook;
+
 // SANCTIONED VISIBILITY-ONLY re-export (Windows/Tauri port, этап 2): expose the EXISTING MlsClient API — the
 // very same items already `#[uniffi::export]`ed to Kotlin/Swift — so a native Rust host (the wry/Tauri desktop
 // backend) can link kvant-mls as an rlib and drive groups directly, instead of going through UniFFI bindings.
@@ -150,6 +153,25 @@ pub struct MlsMeasure {
 }
 
 /// Confirm at runtime that X-Wing (0x004D) is the ciphersuite — belt to the source grep.
+/// A-CRASH-FIX §2: поставить процессный хук паники и сказать ему, куда писать журнал приложения.
+///
+/// ПУТЬ ПРИХОДИТ СНАРУЖИ, и это не мелочь: крейт не знает и не должен знать, где у приложения
+/// журнал (на Android это filesDir, на iOS — Application Support, и оба решения приняты в JS,
+/// crashlog.ts). Передать путь — единственный способ не завести здесь ВТОРУЮ копию этого решения.
+///
+/// Идемпотентно: повторный вызов только обновляет путь. Возвращает, стоит ли хук.
+#[uniffi::export]
+pub fn mls_install_panic_logger(log_path: String) -> bool {
+    panichook::install(log_path)
+}
+
+/// Стоит ли хук — для самопроверки с устройства (Диагностика), чтобы «след будет» не оставалось
+/// обещанием, которое никто не проверял.
+#[uniffi::export]
+pub fn mls_panic_logger_installed() -> bool {
+    panichook::is_installed()
+}
+
 #[uniffi::export]
 pub fn mls_ciphersuite_info() -> String {
     format!("{:?} = 0x{:04X}", CIPHERSUITE, u16::from(CIPHERSUITE))
