@@ -730,3 +730,168 @@ fn non_admin_removing_the_owner_is_refused_by_everyone() {
         "и bob действительно вышел из состава"
     );
 }
+
+// ═══ A-MLS-PRUNE: обрезка состояния ══════════════════════════════════════════════════════════
+//
+// Полевой повод: `mls-state.bin` 18.6 МБ против 2.7 МБ на соседнем устройстве и петля рестартов
+// (iOS убивает за память при старте). Замер показал, что растут ДВЕ вещи и обе по нашей вине:
+// пул KeyPackage (новый на каждый publishAccount, прежний остаётся) и состояние групп, из
+// которых устройство уже вышло. Плюс множитель 3.6× от сериализации.
+//
+// ГЛАВНОЕ, ЧТО ЗДЕСЬ ПРОВЕРЯЕТСЯ, — не «размер упал». Размер легко уронить, выбросив нужное.
+// Проверяется ГРАНИЦА: после обрезки живые группы продолжают работать, а сообщение, зашифрованное
+// ДО обрезки, читается ПОСЛЕ неё.
+
+/// Размер состояния: (байт в файле, ключей в хранилище).
+fn state_size(c: &MlsClient) -> (usize, usize) {
+    let blob = c.export_state().unwrap();
+    let f = c.state_footprint();
+    (blob.len(), f.keys as usize)
+}
+
+#[test]
+fn prune_shrinks_state_and_keeps_live_groups_working() {
+    let (alice, bob, gid, _, _) = two_member_group();
+
+    // Живая группа должна пережить всё, что ниже. Сообщение шифруется СЕЙЧАС, читается ПОСЛЕ
+    // обрезки — это и есть «старые сообщения активных групп читаются».
+    let old_wire = alice
+        .encrypt_message(gid.clone(), "сообщение до обрезки".as_bytes().to_vec())
+        .unwrap();
+
+    // ── РАЗДУВАЕМ: мёртвые группы + поколения пула ──────────────────────────────────────────
+    let mut dead = Vec::new();
+    for _ in 0..10 {
+        let g = alice.create_group().unwrap();
+        let _ = alice.encrypt_message(g.clone(), b"x".to_vec()).unwrap();
+        dead.push(g);
+    }
+    for _ in 0..5 {
+        let _ = alice.make_key_packages(10).unwrap(); // СТАРЫЙ путь: поколения копятся
+    }
+    let (fat_bytes, fat_keys) = state_size(&alice);
+    assert!(fat_keys > 100, "контроль: состояние действительно раздулось — ключей {fat_keys}");
+
+    // ── ОБРЕЗКА 1: поколения пула ───────────────────────────────────────────────────────────
+    let fresh = alice.rotate_key_packages(10).unwrap();
+    assert_eq!(fresh.len(), 10, "новый пул выдан целиком");
+    let (after_kp, _) = state_size(&alice);
+    assert!(after_kp < fat_bytes, "ротация пула обязана уменьшить состояние: {fat_bytes} → {after_kp}");
+
+    // ── ОБРЕЗКА 2: мёртвые группы ───────────────────────────────────────────────────────────
+    for g in &dead {
+        assert!(alice.forget_group(g.clone()).unwrap(), "мёртвая группа забыта");
+    }
+    let (after_all, after_keys) = state_size(&alice);
+    assert!(after_all < after_kp, "забывание групп обязано уменьшить состояние: {after_kp} → {after_all}");
+    assert!(
+        after_all * 3 < fat_bytes,
+        "обрезка обязана дать КРАТНОЕ падение, а не косметику: {fat_bytes} → {after_all}"
+    );
+    println!("A-MLS-PRUNE: {fat_bytes} Б / {fat_keys} ключей → {after_all} Б / {after_keys} ключей");
+
+    // ── ГРАНИЦА: живая группа цела ──────────────────────────────────────────────────────────
+    let got = bob.process_incoming(gid.clone(), old_wire).unwrap();
+    assert_eq!(
+        String::from_utf8(got.plaintext.clone().unwrap()).unwrap(),
+        "сообщение до обрезки",
+        "🔴 сообщение, зашифрованное ДО обрезки, читается ПОСЛЕ неё"
+    );
+
+    let fresh_wire = alice
+        .encrypt_message(gid.clone(), "после обрезки".as_bytes().to_vec())
+        .unwrap();
+    let got2 = bob.process_incoming(gid.clone(), fresh_wire).unwrap();
+    assert_eq!(
+        String::from_utf8(got2.plaintext.unwrap()).unwrap(),
+        "после обрезки",
+        "🔴 живая группа работает после обрезки"
+    );
+    let back = bob
+        .encrypt_message(gid.clone(), "и обратно".as_bytes().to_vec())
+        .unwrap();
+    let got3 = alice.process_incoming(gid.clone(), back).unwrap();
+    assert_eq!(
+        String::from_utf8(got3.plaintext.unwrap()).unwrap(),
+        "и обратно",
+        "🔴 …и в обратную сторону тоже"
+    );
+
+    // Забыть уже забытую — не ошибка, а `false`: приложение может пометить удаление дважды.
+    assert!(!alice.forget_group(dead[0].clone()).unwrap(), "повторное забывание идемпотентно");
+
+    // Живую группу забывать НЕ пробуем: это не свойство обрезки, а решение приложения о том,
+    // когда выход подтверждён (см. шапку forget_group). Проверка «живая работает» выше и есть
+    // граница, которую обрезка не имеет права перейти.
+}
+
+/// Разбор нового формата состояния СРЕДСТВАМИ ТЕСТА: тест не должен звать приватный кодек, иначе
+/// он проверял бы кодек им же самим. Формат: `KVMS1` ∥ u32 n ∥ (u32 len ∥ байты) × 2.
+fn decode_for_test(blob: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    assert!(blob.starts_with(b"KVMS1"), "не новый формат");
+    let mut out = Vec::new();
+    let mut p = 5usize;
+    let n = u32::from_be_bytes(blob[p..p + 4].try_into().unwrap()) as usize;
+    p += 4;
+    for _ in 0..n {
+        let kl = u32::from_be_bytes(blob[p..p + 4].try_into().unwrap()) as usize;
+        p += 4;
+        let k = blob[p..p + kl].to_vec();
+        p += kl;
+        let vl = u32::from_be_bytes(blob[p..p + 4].try_into().unwrap()) as usize;
+        p += 4;
+        let v = blob[p..p + vl].to_vec();
+        p += vl;
+        out.push((k, v));
+    }
+    assert_eq!(p, blob.len(), "разбор не сошёлся с длиной");
+    out
+}
+
+#[test]
+fn state_format_is_compact_and_reads_the_old_one() {
+    let (alice, _bob, gid, _, _) = two_member_group();
+    let _ = alice.make_key_packages(4).unwrap();
+
+    let blob = alice.export_state().unwrap();
+    let f = alice.state_footprint();
+    assert!(blob.starts_with(b"KVMS1"), "новый формат помечен магией");
+    // Раздутие: было 3.6×, стало — служебные 8 байт на запись.
+    let overhead = blob.len() as f64 / f.bytes as f64;
+    assert!(overhead < 1.1, "формат обязан быть компактным, а не в 3.6 раза больше: {overhead:.2}x");
+
+    // Круговорот: экспорт → импорт → те же байты.
+    let (again, _, _) = mk(9, 10, b"alice");
+    again.import_state(blob.clone()).unwrap();
+    // Сравниваются НАБОРЫ пар, а не байты: хранилище — HashMap, порядок обхода не определён, и
+    // формат его не обещает. Первая редакция сравнивала байты и покраснела по делу — но дефект
+    // был в ожидании, а не в кодеке.
+    let pairs = |b: &[u8]| {
+        let mut v = decode_for_test(b);
+        v.sort();
+        v
+    };
+    assert_eq!(pairs(&again.export_state().unwrap()), pairs(&blob),
+               "импорт нового формата возвращает то же СОДЕРЖИМОЕ");
+
+    // СТАРЫЙ ФОРМАТ ЧИТАЕТСЯ. На устройствах лежат JSON-файлы, и обновление сборки не должно
+    // означать потерю аккаунта. Старый файл собирается разбором нового — так тест не зависит от
+    // приватных внутренностей кодека.
+    let legacy_json = serde_json::to_vec(&decode_for_test(&blob)).unwrap();
+    assert!(legacy_json.len() > blob.len() * 2, "контроль: старый формат действительно кратно толще");
+
+    let (old_reader, _, _) = mk(11, 12, b"alice");
+    old_reader.import_state(legacy_json).unwrap();
+    assert!(old_reader.group_epoch(gid.clone()).is_ok(), "🔴 состояние из СТАРОГО файла работает");
+    assert!(
+        old_reader.export_state().unwrap().starts_with(b"KVMS1"),
+        "…и пересохраняется уже в новом формате (миграция без отдельного шага)"
+    );
+
+    // Битый файл — отказ, а не паника и не гигабайтная аллокация.
+    let mut broken = blob.clone();
+    broken.truncate(blob.len() - 3);
+    assert!(alice.import_state(broken).is_err(), "обрыв файла обязан быть отказом");
+    let bogus = vec![b'K', b'V', b'M', b'S', b'1', 0xff, 0xff, 0xff, 0xff];
+    assert!(alice.import_state(bogus).is_err(), "неправдоподобное число записей обязано быть отказом");
+}

@@ -69,6 +69,15 @@ fn cred_account_id(credential: &Credential) -> Option<Vec<u8>> {
 
 // ----------------------------- FFI result types ------------------------------
 
+/// A-MLS-PRUNE: размер состояния MLS, как его видит сам крейт — до сериализации и без её обёртки.
+#[derive(uniffi::Record)]
+pub struct StateFootprint {
+    /// Сколько ключей в хранилище.
+    pub keys: u32,
+    /// Сырые байты (ключи + запечатанные значения), БЕЗ раздутия сериализации.
+    pub bytes: u64,
+}
+
 #[derive(uniffi::Record)]
 pub struct AddResult {
     pub commit: Vec<u8>,       // MlsMessageOut wire (send to existing members)
@@ -495,10 +504,91 @@ impl MlsClient {
     }
 
     /// Export the sealed group state (Contract-2 ciphertext) for app-managed persistence (decision 2b).
+    // ═══ A-MLS-PRUNE: ОБРЕЗКА СОСТОЯНИЯ ═══════════════════════════════════════════════════════
+    //
+    // ЗАЧЕМ. Полевой замер: `mls-state.bin` 18.6 МБ на одном устройстве против 2.7 МБ на другом,
+    // и на большом — петля рестартов (iOS убивает за память при старте, jetsam). Разбор показал,
+    // что «старые эпохи» ни при чём — OpenMLS держит MaxEpochs(0) и чистит их сам. Копятся две
+    // вещи, обе по нашей вине (замер и цифры — в шапке обрезки в storage.rs).
+    //
+    // ОБЩЕЕ ПРАВИЛО ОБЕИХ ОПЕРАЦИЙ: снимается только то, что больше НЕ МОЖЕТ ПОНАДОБИТЬСЯ. Не
+    // «давно не использовалось» и не «выглядит лишним» — ровно то же различие между
+    // положительным и отрицательным признаком, на котором стоит подметание осиротевших листьев
+    // (mlsOrphanLeaf.js). Прямая секретность при этом не страдает и не улучшается: обрезка
+    // УДАЛЯЕТ ключевой материал, то есть может только сузить окно чтения, но не расширить его.
+
+    /// Построить СВЕЖИЙ пул одноразовых KeyPackage и снять ПРЕЖНЕЕ поколение.
+    ///
+    /// Почему это одна операция, а не две. Снимать «всё, кроме нового» можно, только зная, что
+    /// новое, — а узнать это без разбора значений можно ровно одним способом: снять снимок ключей
+    /// ДО постройки и удалить именно его. Разнеси это на два вызова — между ними появится окно, в
+    /// котором приложение решает, что считать новым, и решение это будет вторым определением того
+    /// же правила.
+    ///
+    /// ЦЕНА, НАЗВАННАЯ ВСЛУХ. Welcome, выписанный на KeyPackage прошлого поколения, после этого не
+    /// откроется: приватная половина снята. Окно не новое — сервер заменяет пул на публикации
+    /// свежего набора (`msgserver.js`: «fresh bundle -> reset consumed single-use MLS KeyPackages»),
+    /// то есть выдавать старый KP он всё равно перестаёт; новым является лишь то, что теперь и у
+    /// нас нечем его открыть. Отказ при этом ЗНАКОМЫЙ и терминальный — класс `no-key-package`,
+    /// который приложение уже подтверждает и не гоняет по кругу. Держать поколение про запас можно
+    /// (оно стоит ~10 КП), и это названный, не закрытый вариант — см. A-MLS-PRUNE §2.3.
+    pub fn rotate_key_packages(&self, count: u32) -> Result<Vec<Vec<u8>>, MlsError> {
+        let g = self.inner.lock().unwrap();
+        let stale = g.provider.storage().key_package_keys();
+        let mut out = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            let bundle = KeyPackage::builder()
+                .leaf_node_capabilities(kvant_caps())
+                .build(CS, &g.provider, &g.signer, g.credential.clone())
+                .map_err(m)?;
+            out.push(bundle.key_package().tls_serialize_detached().map_err(m)?);
+        }
+        // Снимок взят ДО постройки, поэтому свежие ключи в него попасть не могли — удаляется ровно
+        // прежнее поколение, и порядок в хранилище (HashMap) роли не играет.
+        let dropped = g.provider.storage().delete_keys(&stale);
+        let _ = dropped;
+        Ok(out)
+    }
+
+    /// Забыть группу: снять её состояние из хранилища целиком.
+    ///
+    /// Зовётся ТОЛЬКО когда выход ПОДТВЕРЖДЁН — то есть коммит администратора уже вынул это
+    /// устройство из дерева, и обрабатывать для этой группы больше нечего. Пока выход лишь
+    /// ЗАПРОШЕН, состояние обязано остаться: подтверждающий коммит приходит именно в него, и
+    /// удалить его раньше значит сделать выход неподтверждаемым навсегда.
+    ///
+    /// Удаляет сама библиотека (`MlsGroup::delete`) — перечислять метки руками значило бы завести
+    /// вторую копию списка того, из чего состоит группа, и разойтись с ней на следующей версии
+    /// OpenMLS. История переписки живёт в приложении и здесь не участвует.
+    ///
+    /// Идемпотентно: группы нет — отвечает `false`, а не ошибкой. Повторный вызов на уже забытой
+    /// группе штатен (приложение может пометить удаление дважды).
+    pub fn forget_group(&self, group_id: Vec<u8>) -> Result<bool, MlsError> {
+        let mut g = self.inner.lock().unwrap();
+        let gid = GroupId::from_slice(&group_id);
+        let loaded = MlsGroup::load(g.provider.storage(), &gid).map_err(m)?;
+        let mut group = match loaded {
+            Some(x) => x,
+            None => { g.groups.remove(&group_id); return Ok(false); }
+        };
+        group.delete(g.provider.storage()).map_err(m)?;
+        g.groups.remove(&group_id);
+        g.roles.remove(&group_id);
+        Ok(true)
+    }
+
+    /// Сколько сейчас весит состояние: (ключей, сырых байт). Для диагностики с устройства — чтобы
+    /// «состояние распухло» было ЗАМЕРОМ, а не догадкой по размеру файла, в котором ещё и обёртка.
+    pub fn state_footprint(&self) -> StateFootprint {
+        let g = self.inner.lock().unwrap();
+        let (keys, bytes) = g.provider.storage().footprint();
+        StateFootprint { keys, bytes }
+    }
+
     pub fn export_state(&self) -> Result<Vec<u8>, MlsError> {
         let g = self.inner.lock().unwrap();
         let dump = g.provider.storage().export_sealed();
-        serde_json::to_vec(&dump).map_err(m)
+        Ok(encode_state(&dump))
     }
 
     /// ЗАГЛЯНУТЬ В КАДР, НЕ ОБРАБАТЫВАЯ ЕГО: эпоха и тип содержимого. И то и другое лежит в ОТКРЫТОЙ
@@ -571,12 +661,79 @@ impl MlsClient {
 
     /// Restore sealed state exported earlier (survive app restart). Clears the live cache → reload on use.
     pub fn import_state(&self, blob: Vec<u8>) -> Result<(), MlsError> {
-        let dump: Vec<(Vec<u8>, Vec<u8>)> = serde_json::from_slice(&blob).map_err(m)?;
+        let dump = decode_state(&blob)?;
         let mut g = self.inner.lock().unwrap();
         g.provider.storage().import_sealed(dump);
         g.groups.clear();
         Ok(())
     }
+}
+
+// ═══ A-MLS-PRUNE: ФОРМАТ СОСТОЯНИЯ ═══════════════════════════════════════════════════════════
+//
+// НАХОДКА, КОТОРУЮ НЕ ИСКАЛИ. Состояние складывалось `serde_json::to_vec` по
+// `Vec<(Vec<u8>, Vec<u8>)>`, а serde_json печатает байтовый массив ДЕСЯТИЧНЫМИ ЧИСЛАМИ через
+// запятую: байт `210` занимает четыре символа. Замер на живом состоянии: **раздутие 3.6×**
+// (30 624 сырых байта → 108 806 в файле). То есть из 18.6 МБ, которые не пережил планшет, около
+// 13.4 МБ — это запятые.
+//
+// Цена этого не только на диске, и это главное: `import_state` на старте разбирает ВЕСЬ файл
+// (18.6 МБ текста → промежуточные аллокации serde → 5.2 МБ данных), и делает это ДО того, как
+// OpenMLS начнёт разворачивать деревья. Для jetsam важен пик, а пик здесь втрое выше нужного.
+//
+// ФОРМАТ: `KVMS1` ∥ u32 число записей ∥ (u32 len ∥ байты) × 2 на запись, big-endian. Значения уже
+// запечатаны (KSE1), ключи — метки и идентификаторы; формат ничего не открывает и не шифрует, он
+// только перестаёт транжирить.
+//
+// СОВМЕСТИМОСТЬ СВЕРХУ ВНИЗ — ОБЯЗАТЕЛЬНА. На устройствах лежат файлы в старом формате, и чтение
+// их обязано продолжать работать: миграция здесь — это «прочитали старое, записали новое», а не
+// «потеряли аккаунт». Поэтому `decode_state` смотрит на магию и разбирает JSON, если её нет.
+// Обратной совместимости (новый файл на старой сборке) нет и не нужно: откат сборки на устройстве
+// не поддерживается и без этого.
+const STATE_MAGIC: &[u8; 5] = b"KVMS1";
+
+fn encode_state(dump: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    let need: usize = dump.iter().map(|(k, v)| 8 + k.len() + v.len()).sum();
+    let mut out = Vec::with_capacity(STATE_MAGIC.len() + 4 + need);
+    out.extend_from_slice(STATE_MAGIC);
+    out.extend_from_slice(&(dump.len() as u32).to_be_bytes());
+    for (k, v) in dump {
+        out.extend_from_slice(&(k.len() as u32).to_be_bytes());
+        out.extend_from_slice(k);
+        out.extend_from_slice(&(v.len() as u32).to_be_bytes());
+        out.extend_from_slice(v);
+    }
+    out
+}
+
+fn decode_state(blob: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, MlsError> {
+    if !blob.starts_with(STATE_MAGIC) {
+        // Старый формат. Разбираем как раньше — файл на устройстве переживает обновление сборки.
+        return serde_json::from_slice(blob).map_err(m);
+    }
+    let mut p = STATE_MAGIC.len();
+    let take = |p: &mut usize, n: usize| -> Result<&[u8], MlsError> {
+        let end = p.checked_add(n).ok_or_else(|| MlsError::Mls("state: длина переполнилась".into()))?;
+        if end > blob.len() { return Err(MlsError::Mls("state: обрыв — файл короче объявленного".into())); }
+        let s = &blob[*p..end];
+        *p = end;
+        Ok(s)
+    };
+    let n = u32::from_be_bytes(take(&mut p, 4)?.try_into().map_err(m)?) as usize;
+    // Потолок на ЧИСЛО записей до аллокации: испорченный заголовок не должен просить гигабайт.
+    // Записей в живом состоянии — сотни; миллион это заведомо мусор, и отказать дешевле, чем
+    // упасть по памяти ровно там, где мы чиним падение по памяти.
+    if n > 1_000_000 { return Err(MlsError::Mls("state: неправдоподобное число записей".into())); }
+    let mut out = Vec::with_capacity(n.min(4096));
+    for _ in 0..n {
+        let kl = u32::from_be_bytes(take(&mut p, 4)?.try_into().map_err(m)?) as usize;
+        let k = take(&mut p, kl)?.to_vec();
+        let vl = u32::from_be_bytes(take(&mut p, 4)?.try_into().map_err(m)?) as usize;
+        let v = take(&mut p, vl)?.to_vec();
+        out.push((k, v));
+    }
+    if p != blob.len() { return Err(MlsError::Mls("state: лишние байты после последней записи".into())); }
+    Ok(out)
 }
 
 #[cfg(test)]
