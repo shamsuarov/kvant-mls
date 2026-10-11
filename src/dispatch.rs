@@ -18,6 +18,9 @@
 
 use openmls::ciphersuite::hash_ref::ProposalRef;
 use openmls::group::StagedWelcome;
+use openmls::prelude::{KeyPackageBundle, KeyPackageRef};
+use openmls::treesync::LeafNodeSource;
+use openmls_traits::storage::StorageProvider as _; // A1: trait-методы key_package / write_key_package / delete_key_package
 use openmls::messages::group_info::GroupInfo;
 use openmls::prelude::tls_codec::Deserialize as _;
 use openmls::prelude::*;
@@ -26,7 +29,7 @@ use openmls_traits::OpenMlsProvider;
 
 use crate::as_validate::{
     decode_identity,
-    validate_leafnode, walk_staged_commit, walk_welcome_tree, CommitReject,
+    credential_identity, validate_leafnode, walk_staged_commit, walk_welcome_tree, CommitReject,
     LeafReject, TrustStore,
 };
 use crate::policy::{assert_ciphersuite, check_no_downgrade, may_remove, DowngradeReject, GroupRoles, MembershipReject, KVANT_DEVCERT_EXT};
@@ -224,15 +227,18 @@ pub fn dispatch_group_message<P: OpenMlsProvider>(
     }
 }
 
-/// Dispatch an incoming WELCOME (join). Fails closed: validates the group's capability floor AND the
-/// WHOLE ratchet tree before joining; on any reject the join does NOT happen (no group is created).
-pub fn dispatch_welcome<P: OpenMlsProvider>(
+/// A1 (stage/commit): ВСЕ проверки Welcome — и ни одной записи группы. Это прежнее тело
+/// `dispatch_welcome` до самого `into_group`, вынесенное дословно, чтобы у stage и commit была
+/// ОДНА цепочка проверок, а не две похожие: §10.11 шифронабор до OpenMLS → build_from_welcome →
+/// B6.2 живая/мёртвая группа → дерево → build() → пол capability → обход всего дерева (B1.3).
+/// Возвращает StagedWelcome: в памяти, в хранилище группы ещё нет.
+fn welcome_checks<P: OpenMlsProvider>(
     provider: &P,
     join_config: &MlsGroupJoinConfig,
     welcome: Welcome,
     ratchet_tree: Option<RatchetTreeIn>,
     ts: &TrustStore,
-) -> Result<MlsGroup, DispatchReject> {
+) -> Result<StagedWelcome, DispatchReject> {
     // B6.2 — RE-JOINING A GROUP WE WERE EVICTED FROM.
     //
     // new_from_welcome hardcodes replace_old_group=false, so a Welcome for a group we still hold any
@@ -322,9 +328,160 @@ pub fn dispatch_welcome<P: OpenMlsProvider>(
     }
     // B1.3: validate EVERY member of the tree A2 handed us before trusting it.
     walk_welcome_tree(&staged, ts).map_err(DispatchReject::Leaf)?;
-    staged
+    Ok(staged)
+}
+
+/// Dispatch an incoming WELCOME (join). Fails closed: validates the group's capability floor AND the
+/// WHOLE ratchet tree before joining; on any reject the join does NOT happen (no group is created).
+/// A1: это COMMIT — вступление по «Принять». Поведение прежнее байт-в-байт: те же проверки
+/// (welcome_checks) и тот же `into_group`; одноразовый KeyPackage сжигается здесь же, где и раньше —
+/// внутри build_from_welcome на реальном вступлении.
+pub fn dispatch_welcome<P: OpenMlsProvider>(
+    provider: &P,
+    join_config: &MlsGroupJoinConfig,
+    welcome: Welcome,
+    ratchet_tree: Option<RatchetTreeIn>,
+    ts: &TrustStore,
+) -> Result<MlsGroup, DispatchReject> {
+    welcome_checks(provider, join_config, welcome, ratchet_tree, ts)?
         .into_group(provider)
         .map_err(|e| DispatchReject::Apply(format!("{e:?}")))
+}
+
+// ----------------------------- A1: STAGE (проверки без вступления) -------------------------
+//
+// ЗАЧЕМ. До A1 Welcome вступал в группу сразу: секреты эпохи чужой группы ложились на диск, а
+// согласие спрашивалось ПОСЛЕ (карантин в приложении). Теперь приход Welcome = stage: все проверки
+// выше, карточка «Принять/Отклонить» строится из ПРОВЕРЕННОГО дерева (StagedInfo), а в хранилище
+// крейта не появляется ни группы, ни её секретов. Вступление (commit) — dispatch_welcome по «Принять».
+//
+// ГЛАВНАЯ ТОНКОСТЬ — ОДНОРАЗОВЫЙ KeyPackage. OpenMLS потребляет его (delete_key_package) уже внутри
+// build_from_welcome (keys_for_welcome, creation.rs), то есть ДО into_group. Без поправки stage был бы
+// необратим: второй раз из того же Welcome не вступить. Поэтому stage снимает запись KeyPackage
+// ДО проверок — через те же trait-методы, которыми OpenMLS её читает и пишет (key_package /
+// write_key_package), без разбора хранилища, — и ВОЗВРАЩАЕТ её после, при любом исходе. Свойство:
+// хранилище после stage = хранилище до stage. Отказ на любой стадии KeyPackage не сжигает — §10.11
+// расширяется на все отказы Welcome, а порядок «шифронабор до OpenMLS» внутри welcome_checks
+// сохранён нетронутым. Last-resort KeyPackage OpenMLS и так не удаляет — ветка без изменений.
+//
+// ЦЕНА, НАЗВАННАЯ ВСЛУХ (FS). Init-ключ KeyPackage живёт до commit/discard, а не сжигается на
+// приходе Welcome. Захват устройства в этом окне открывает GroupSecrets ЭТОГО Welcome — секреты
+// одной эпохи группы, куда звали. До A1 в то же окно на диске лежало ВСЁ состояние этой группы;
+// окно A1 строго уже. По «Отклонить»/TTL приложение зовёт burn_welcome_key_package — init-ключ
+// отказ не переживает (решение владельца 2, 2026-10-11).
+
+/// Один лист проверенного дерева — то, из чего приложение строит карточку приглашения.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedLeaf {
+    pub leaf_index: u32,
+    pub account_id: Vec<u8>,
+    pub device_id: Vec<u8>,
+}
+
+/// Откуда взялся лист (LeafNodeSource) — перечислено ПОИМЁННО, без `_`: новый вариант в библиотеке
+/// после бампа — ошибка сборки, а не тихий пропуск.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeafOrigin {
+    KeyPackage,
+    Update,
+    Commit,
+}
+
+fn leaf_origin(src: &LeafNodeSource) -> LeafOrigin {
+    match src {
+        LeafNodeSource::KeyPackage(_lifetime) => LeafOrigin::KeyPackage,
+        LeafNodeSource::Update => LeafOrigin::Update,
+        LeafNodeSource::Commit(_parent_hash) => LeafOrigin::Commit,
+    }
+}
+
+/// Что stage узнал о группе — всё из ПРОВЕРЕННОГО дерева (walk_welcome_tree прошёл), ничего со слов
+/// пригласившего.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StagedInfo {
+    pub gid: Vec<u8>,
+    pub epoch: u64,
+    pub ciphersuite: u16,
+    pub members: Vec<StagedLeaf>,
+    pub sender_account_id: Vec<u8>,
+    pub sender_leaf_origin: LeafOrigin,
+    pub own_leaf_index: u32,
+}
+
+fn staged_info(staged: &StagedWelcome) -> Result<StagedInfo, DispatchReject> {
+    let ctx = staged.group_context();
+    let mut members = Vec::new();
+    for m in staged.members() {
+        // walk_welcome_tree уже принял каждый лист; здесь только раскладываем тот же credential.
+        let (account_id, cert) = credential_identity(&m.credential).ok_or(DispatchReject::Leaf(LeafReject::IdentityDecode))?;
+        members.push(StagedLeaf { leaf_index: m.index.u32(), account_id, device_id: cert.device_id });
+    }
+    let sender = staged.welcome_sender().map_err(|e| DispatchReject::Process(format!("{e:?}")))?;
+    let (sender_account_id, _cert) = credential_identity(sender.credential()).ok_or(DispatchReject::Leaf(LeafReject::IdentityDecode))?;
+    Ok(StagedInfo {
+        gid: ctx.group_id().as_slice().to_vec(),
+        epoch: ctx.epoch().as_u64(),
+        ciphersuite: u16::from(ctx.ciphersuite()),
+        members,
+        sender_account_id,
+        sender_leaf_origin: leaf_origin(sender.leaf_node_source()),
+        own_leaf_index: staged.own_leaf_index().u32(),
+    })
+}
+
+/// Записи KeyPackage, которым адресован этот Welcome и которые у нас есть (hash_ref из открытой
+/// части Welcome — welcome.secrets()[i].new_member()), прочитанные теми же trait-методами, что и
+/// OpenMLS. Last-resort не снимается и не возвращается: библиотека его не удаляет.
+fn own_key_packages_for<P: OpenMlsProvider>(provider: &P, welcome: &Welcome) -> Result<Vec<(KeyPackageRef, KeyPackageBundle)>, DispatchReject> {
+    let mut out = Vec::new();
+    for egs in welcome.secrets() {
+        let r = egs.new_member();
+        let found: Option<KeyPackageBundle> = provider
+            .storage()
+            .key_package(&r)
+            .map_err(|e| DispatchReject::Apply(format!("{e:?}")))?;
+        if let Some(b) = found {
+            if !b.key_package().last_resort() { out.push((r, b)); }
+        }
+    }
+    Ok(out)
+}
+
+/// A1 STAGE: все проверки Welcome, без вступления и без следа в хранилище. Ok(StagedInfo) — группу
+/// МОЖНО принять (commit = dispatch_welcome от тех же байтов); Err — тот же типовой отказ, что дал
+/// бы join. В обоих случаях KeyPackage остаётся там, где был.
+pub fn stage_welcome<P: OpenMlsProvider>(
+    provider: &P,
+    join_config: &MlsGroupJoinConfig,
+    welcome: Welcome,
+    ratchet_tree: Option<RatchetTreeIn>,
+    ts: &TrustStore,
+) -> Result<StagedInfo, DispatchReject> {
+    let mine = own_key_packages_for(provider, &welcome)?;
+    let res = welcome_checks(provider, join_config, welcome, ratchet_tree, ts).and_then(|staged| staged_info(&staged));
+    // ВСЕГДА, при любом исходе: stage обязан оставить хранилище KeyPackage таким, каким нашёл.
+    for (r, b) in &mine {
+        provider
+            .storage()
+            .write_key_package(r, b)
+            .map_err(|e| DispatchReject::Apply(format!("restore key package: {e:?}")))?;
+    }
+    res
+}
+
+/// A1 DISCARD («Отклонить»/TTL): сжечь одноразовый KeyPackage, которому адресован Welcome, — ровно
+/// тот, который сжёг бы commit. Возвращает, сколько записей снято (0 — нечего: уже сожжён, чужой
+/// Welcome, last-resort). Сам Welcome крейт не хранит — забывать нечего.
+pub fn burn_welcome_key_package<P: OpenMlsProvider>(provider: &P, welcome: &Welcome) -> Result<u32, DispatchReject> {
+    let mut n = 0u32;
+    for (r, _b) in own_key_packages_for(provider, welcome)? {
+        provider
+            .storage()
+            .delete_key_package(&r)
+            .map_err(|e| DispatchReject::Apply(format!("burn key package: {e:?}")))?;
+        n += 1;
+    }
+    Ok(n)
 }
 
 // ----------------------------- SEND side (symmetric) -------------------------

@@ -17,9 +17,9 @@ use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_traits::OpenMlsProvider;
 
-use crate::as_validate::{decode_identity, TrustStore};
+use crate::as_validate::{credential_identity, decode_identity, TrustStore};
 use crate::devicecert::{DeviceCert, Revocation};
-use crate::dispatch::{dispatch_group_message, dispatch_welcome, guarded_add_members, DispatchReject, Disposition};
+use crate::dispatch::{burn_welcome_key_package, dispatch_group_message, dispatch_welcome, guarded_add_members, stage_welcome, DispatchReject, Disposition, LeafOrigin};
 use crate::policy::{assert_ciphersuite, floor_required_capabilities, GroupRoles};
 use crate::storage::KseProvider;
 use crate::{guard, MlsError};
@@ -60,8 +60,7 @@ fn group_config() -> MlsGroupCreateConfig {
 // Decode the (account_id, device_cert) carried in a member's BasicCredential
 // (identity = encode_identity(account_id, cert)).
 fn cred_identity(credential: &Credential) -> Option<(Vec<u8>, DeviceCert)> {
-    let basic = BasicCredential::try_from(credential.clone()).ok()?;
-    decode_identity(basic.identity())
+    credential_identity(credential) // A1: один exhaustive-разбор типа credential'а на весь крейт
 }
 fn cred_account_id(credential: &Credential) -> Option<Vec<u8>> {
     cred_identity(credential).map(|(account_id, _cert)| account_id)
@@ -104,10 +103,51 @@ pub struct MemberAccountKey {
     pub account_public_key: Vec<u8>,  // the account's Ed25519 pub, ATTESTED by the validated tree leaf
 }
 
+/// A1 (stage/commit): один лист ПРОВЕРЕННОГО дерева Welcome — для карточки «Принять/Отклонить».
+#[derive(uniffi::Record)]
+pub struct StagedLeafRec {
+    pub leaf_index: u32,
+    pub account_id: Vec<u8>,   // canonical-nick bytes
+    pub device_id: Vec<u8>,    // cert.device_id
+}
+
+/// A1: откуда взялся лист пригласившего (LeafNodeSource, перечислено поимённо).
+#[derive(uniffi::Enum)]
+pub enum LeafOriginKind {
+    KeyPackage,
+    Update,
+    Commit,
+}
+
+/// A1: итог stage — всё из проверенного дерева, ничего со слов пригласившего. Группы в хранилище
+/// после stage НЕТ; вступление — join_from_welcome от тех же байтов по «Принять».
+#[derive(uniffi::Record)]
+pub struct StagedWelcomeInfo {
+    pub gid: Vec<u8>,
+    pub epoch: u64,
+    pub ciphersuite: u16,
+    pub members: Vec<StagedLeafRec>,
+    pub sender_account_id: Vec<u8>,
+    pub sender_leaf_origin: LeafOriginKind,
+    pub own_leaf_index: u32,
+}
+
 #[derive(uniffi::Record)]
 pub struct MemberDevice {
     pub account_id: Vec<u8>,  // canonical-nick bytes
     pub device_id: Vec<u8>,   // cert.device_id (fingerprint of the MLS leaf key) — the remove_device target
+}
+
+/// A1: Welcome из провода — EXHAUSTIVE MATCH по телу сообщения, без `_`: каждый тип тела назван.
+fn welcome_of(welcome_wire: &[u8]) -> Result<Welcome, MlsError> {
+    let msg_in = MlsMessageIn::tls_deserialize_exact(welcome_wire).map_err(m)?;
+    match msg_in.extract() {
+        MlsMessageBodyIn::Welcome(w) => Ok(w),
+        MlsMessageBodyIn::PublicMessage(_) => Err(MlsError::Mls("not a welcome: PublicMessage".into())),
+        MlsMessageBodyIn::PrivateMessage(_) => Err(MlsError::Mls("not a welcome: PrivateMessage".into())),
+        MlsMessageBodyIn::GroupInfo(_) => Err(MlsError::Mls("not a welcome: GroupInfo".into())),
+        MlsMessageBodyIn::KeyPackage(_) => Err(MlsError::Mls("not a welcome: KeyPackage".into())),
+    }
 }
 
 // ----------------------------- the client ------------------------------------
@@ -484,13 +524,44 @@ impl MlsClient {
         })
     }
 
+    /// A1 STAGE: все проверки Welcome (те же, что у join_from_welcome), без вступления и без следа в
+    /// хранилище; KeyPackage остаётся на месте (см. dispatch::stage_welcome). Под guard() [C1].
+    pub fn stage_welcome(&self, welcome_wire: Vec<u8>, ratchet_tree: Vec<u8>) -> Result<StagedWelcomeInfo, MlsError> {
+        let welcome = welcome_of(&welcome_wire)?;
+        let tree_in = RatchetTreeIn::tls_deserialize_exact(&ratchet_tree).map_err(m)?;
+        let g = self.inner.lock().unwrap();
+        let cfg = group_config();
+        let info = guard("stage_welcome", || {
+            stage_welcome(&g.provider, cfg.join_config(), welcome, Some(tree_in), &g.ts).map_err(rej)
+        })?;
+        Ok(StagedWelcomeInfo {
+            gid: info.gid,
+            epoch: info.epoch,
+            ciphersuite: info.ciphersuite,
+            members: info.members.into_iter().map(|l| StagedLeafRec { leaf_index: l.leaf_index, account_id: l.account_id, device_id: l.device_id }).collect(),
+            sender_account_id: info.sender_account_id,
+            sender_leaf_origin: match info.sender_leaf_origin {
+                LeafOrigin::KeyPackage => LeafOriginKind::KeyPackage,
+                LeafOrigin::Update => LeafOriginKind::Update,
+                LeafOrigin::Commit => LeafOriginKind::Commit,
+            },
+            own_leaf_index: info.own_leaf_index,
+        })
+    }
+
+    /// A1 DISCARD («Отклонить»/TTL, решение владельца 2): сжечь одноразовый KeyPackage этого Welcome —
+    /// init-ключ отказ не переживает. Сколько снято (0 = нечего). Группы это не касается: её нет.
+    pub fn discard_welcome(&self, welcome_wire: Vec<u8>) -> Result<u32, MlsError> {
+        let welcome = welcome_of(&welcome_wire)?;
+        let g = self.inner.lock().unwrap();
+        guard("burn_welcome_key_package", || burn_welcome_key_package(&g.provider, &welcome).map_err(rej))
+    }
+
     /// Join from a Welcome. Wraps dispatch_welcome (whole-tree ghost check + floor) under guard() [C1].
+    /// A1: это COMMIT («Принять») — без изменений: те же проверки, тот же into_group, KeyPackage
+    /// сжигается здесь же, где и раньше.
     pub fn join_from_welcome(&self, welcome_wire: Vec<u8>, ratchet_tree: Vec<u8>) -> Result<Vec<u8>, MlsError> {
-        let msg_in = MlsMessageIn::tls_deserialize_exact(&welcome_wire).map_err(m)?;
-        let welcome = match msg_in.extract() {
-            MlsMessageBodyIn::Welcome(w) => w,
-            _ => return Err(MlsError::Mls("not a welcome".into())),
-        };
+        let welcome = welcome_of(&welcome_wire)?;
         let tree_in = RatchetTreeIn::tls_deserialize_exact(&ratchet_tree).map_err(m)?;
         let mut g = self.inner.lock().unwrap();
         let Inner { provider, ts, .. } = &mut *g;
@@ -914,7 +985,7 @@ pub mod fuzz {
         let mut carol_last_removed_epoch_msg: Option<Vec<u8>> = None;
 
         for &b in data {
-            match b % 5 {
+            match b % 6 {
                 0 => {
                     // alice → group app; bob (and carol if in) process
                     if let Ok(w) = alice.encrypt_message(gid.clone(), b"a".to_vec()) {
@@ -941,6 +1012,34 @@ pub mod fuzz {
                             assert_eq!(am, bm, "alice/bob disagree on members after add");
                             assert!(am.contains(&c_id), "carol missing from the member set after add");
                         }
+                    }
+                }
+                4 if !carol_in => {
+                    // A1: alice adds carol → carol STAGES the welcome (must pass on a genuine one), bob applies
+                    // the commit, then carol COMMITS. Invariants: stage leaves carol's store exactly as it
+                    // was (frozen writes + KeyPackage count), stage is repeatable, and the commit still
+                    // succeeds afterwards (KeyPackage not burned by stage).
+                    if let Ok(add) = alice.add_member(gid.clone(), carol.make_key_package().unwrap()) {
+                        let (fw, kps) = {
+                            let g = carol.inner.lock().unwrap();
+                            (g.provider.storage().counters.frozen_writes(), g.provider.storage().key_package_keys().len())
+                        };
+                        let s1 = carol.stage_welcome(add.welcome.clone(), add.ratchet_tree.clone());
+                        assert!(s1.is_ok(), "A1: stage of a GENUINE welcome refused: {:?}", s1.err());
+                        let s2 = carol.stage_welcome(add.welcome.clone(), add.ratchet_tree.clone());
+                        assert!(s2.is_ok(), "A1: second stage refused (stage must be repeatable)");
+                        {
+                            let g = carol.inner.lock().unwrap();
+                            assert_eq!(g.provider.storage().counters.frozen_writes(), fw, "A1: stage wrote FROZEN state");
+                            assert_eq!(g.provider.storage().key_package_keys().len(), kps, "A1: stage changed the KeyPackage pool");
+                        }
+                        assert!(carol.member_account_ids(gid.clone()).is_err(), "A1: stage created a group");
+                        let _ = bob.process_incoming(gid.clone(), add.commit);
+                        assert!(carol.join_from_welcome(add.welcome, add.ratchet_tree).is_ok(), "A1: commit after stage failed (KeyPackage burned?)");
+                        carol_in = true;
+                        let am = sorted(alice.member_account_ids(gid.clone()).unwrap());
+                        let cm = sorted(carol.member_account_ids(gid.clone()).unwrap());
+                        assert_eq!(am, cm, "alice/carol disagree on members after stage→commit");
                     }
                 }
                 3 if carol_in => {

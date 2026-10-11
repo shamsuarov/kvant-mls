@@ -895,3 +895,84 @@ fn state_format_is_compact_and_reads_the_old_one() {
     let bogus = vec![b'K', b'V', b'M', b'S', b'1', 0xff, 0xff, 0xff, 0xff];
     assert!(alice.import_state(bogus).is_err(), "неправдоподобное число записей обязано быть отказом");
 }
+
+// ---------------- A1: stage/commit через MlsClient (FFI-уровень) ----------------
+
+fn frozen_writes(c: &Arc<MlsClient>) -> u64 { c.inner.lock().unwrap().provider.storage().counters.frozen_writes() }
+fn kp_count(c: &Arc<MlsClient>) -> usize { c.inner.lock().unwrap().provider.storage().key_package_keys().len() }
+
+#[test]
+fn a1_client_stage_then_commit_roundtrip() {
+    let (alice, a_id, a_pub) = mk(1, 2, b"alice");
+    let (bob, b_id, b_pub) = mk(3, 4, b"bob");
+    alice.pin_account(b_id.clone(), b_pub.clone());
+    bob.pin_account(a_id.clone(), a_pub.clone());
+    let gid = alice.create_group().unwrap();
+    let add = alice.add_member(gid.clone(), bob.make_key_package().unwrap()).unwrap();
+
+    let fw = frozen_writes(&bob);
+    let kps = kp_count(&bob);
+    let info = bob.stage_welcome(add.welcome.clone(), add.ratchet_tree.clone()).expect("stage");
+    assert_eq!(info.gid, gid);
+    assert_eq!(info.sender_account_id, b"alice".to_vec());
+    let mut ids: Vec<Vec<u8>> = info.members.iter().map(|l| l.account_id.clone()).collect();
+    ids.sort();
+    assert_eq!(ids, vec![b"alice".to_vec(), b"bob".to_vec()]);
+    assert_eq!(info.own_leaf_index, 1);
+    assert_eq!(frozen_writes(&bob), fw, "🔴 stage не пишет в FROZEN-пространство (membership/config/proposals)");
+    assert_eq!(kp_count(&bob), kps, "🔴 пул KeyPackage после stage тот же");
+    assert!(bob.member_account_ids(gid.clone()).is_err(), "группы у bob ещё нет");
+
+    assert_eq!(bob.join_from_welcome(add.welcome, add.ratchet_tree).unwrap(), gid, "commit");
+    assert_eq!(kp_count(&bob), kps - 1, "commit сжёг одноразовый KeyPackage — там же, где и до A1");
+    let wire = alice.encrypt_message(gid.clone(), b"hello".to_vec()).unwrap();
+    let r = bob.process_incoming(gid, wire).unwrap();
+    assert_eq!(r.plaintext.as_deref(), Some(&b"hello"[..]));
+}
+
+#[test]
+fn a1_client_stage_survives_restart_then_commit() {
+    let (alice, a_id, a_pub) = mk(1, 2, b"alice");
+    let (bob, b_id, b_pub) = mk(3, 4, b"bob");
+    alice.pin_account(b_id.clone(), b_pub.clone());
+    bob.pin_account(a_id.clone(), a_pub.clone());
+    let gid = alice.create_group().unwrap();
+    let add = alice.add_member(gid.clone(), bob.make_key_package().unwrap()).unwrap();
+    bob.stage_welcome(add.welcome.clone(), add.ratchet_tree.clone()).expect("stage");
+    // перезапуск: приложение хранит сырые байты Welcome, крейт — только свой запечатанный экспорт
+    let blob = bob.export_state().unwrap();
+    let (bob2, _, _) = mk(3, 4, b"bob");
+    bob2.pin_account(a_id, a_pub);
+    bob2.import_state(blob).unwrap();
+    let info = bob2.stage_welcome(add.welcome.clone(), add.ratchet_tree.clone()).expect("stage после перезапуска");
+    assert_eq!(info.gid, gid);
+    assert_eq!(bob2.join_from_welcome(add.welcome, add.ratchet_tree).unwrap(), gid);
+    let wire = alice.encrypt_message(gid.clone(), b"after-restart".to_vec()).unwrap();
+    assert_eq!(bob2.process_incoming(gid, wire).unwrap().plaintext.as_deref(), Some(&b"after-restart"[..]));
+}
+
+#[test]
+fn a1_client_discard_then_commit_fails() {
+    let (alice, a_id, a_pub) = mk(1, 2, b"alice");
+    let (bob, b_id, b_pub) = mk(3, 4, b"bob");
+    alice.pin_account(b_id.clone(), b_pub.clone());
+    bob.pin_account(a_id.clone(), a_pub.clone());
+    let gid = alice.create_group().unwrap();
+    let add = alice.add_member(gid.clone(), bob.make_key_package().unwrap()).unwrap();
+    bob.stage_welcome(add.welcome.clone(), add.ratchet_tree.clone()).expect("stage");
+    let kps = kp_count(&bob);
+    assert_eq!(bob.discard_welcome(add.welcome.clone()).unwrap(), 1);
+    assert_eq!(kp_count(&bob), kps - 1, "discard сжёг ровно один KeyPackage");
+    assert!(bob.join_from_welcome(add.welcome, add.ratchet_tree).is_err(), "после «Отклонить» вступить нельзя");
+    assert!(bob.member_account_ids(gid).is_err());
+}
+
+#[test]
+fn a1_not_a_welcome_named_by_body_type() {
+    let (alice, _, _) = mk(1, 2, b"alice");
+    let gid = alice.create_group().unwrap();
+    let app = alice.encrypt_message(gid, b"x".to_vec()).unwrap();
+    let e = alice.stage_welcome(app, vec![]).err().expect("не Welcome");
+    assert!(format!("{e:?}").contains("not a welcome: PrivateMessage"), "{e:?}");
+}
+

@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 
 use openmls::prelude::{
-    BasicCredential, Credential, LeafNode, Proposal, StagedCommit,
+    BasicCredential, Credential, CredentialType, LeafNode, Proposal, StagedCommit,
 };
 use openmls::group::StagedWelcome;
 
@@ -148,9 +148,28 @@ pub fn decode_identity(b: &[u8]) -> Option<(Vec<u8>, DeviceCert)> {
 
 /// The core AS decision for ONE leaf: its credential + signature_key must chain — via the C3-LINKED
 /// device cert — to a TOFU-pinned account, and not be revoked. Fail-closed throughout.
+/// A1: тип credential'а — EXHAUSTIVE MATCH, без `_`. Каждый тип, который библиотека умеет назвать,
+/// решается здесь по имени; появись в OpenMLS новый вариант — это ошибка сборки, а не тихий пропуск
+/// через подстановочную ветку. Принимается ровно один тип: Basic (с нашим KMI1-identity внутри).
+pub fn basic_of(credential: &Credential) -> Result<BasicCredential, LeafReject> {
+    match credential.credential_type() {
+        CredentialType::Basic => BasicCredential::try_from(credential.clone()).map_err(|_| LeafReject::NotBasicCredential),
+        CredentialType::X509 => Err(LeafReject::NotBasicCredential),
+        CredentialType::Grease(_code) => Err(LeafReject::NotBasicCredential),
+        CredentialType::Other(_code) => Err(LeafReject::NotBasicCredential),
+    }
+}
+
+/// (account_id, device cert) из credential'а — тем же exhaustive-разбором типа, что и валидация.
+/// None = не Basic или identity не наш формат (вызывающий решает, отказ это или «не наш лист»).
+pub fn credential_identity(credential: &Credential) -> Option<(Vec<u8>, DeviceCert)> {
+    let basic = basic_of(credential).ok()?;
+    decode_identity(basic.identity())
+}
+
 pub fn validate_leaf(credential: &Credential, sig_key: &[u8], ts: &TrustStore) -> Result<(), LeafReject> {
-    // Must be a BasicCredential (never X.509 / other).
-    let basic = BasicCredential::try_from(credential.clone()).map_err(|_| LeafReject::NotBasicCredential)?;
+    // Must be a BasicCredential (never X.509 / GREASE / other) — A1: перечислено поимённо в basic_of.
+    let basic = basic_of(credential)?;
     // Unpack the account-id + device cert carried in the identity.
     let (account_id, cert) = decode_identity(basic.identity()).ok_or(LeafReject::IdentityDecode)?;
     // The account-id MUST be one the user has pinned — an unknown account fails closed (no implicit trust).
@@ -202,6 +221,11 @@ pub fn walk_staged_commit(sc: &StagedCommit, ts: &TrustStore) -> Result<(), Comm
 
 /// Validate a STANDALONE proposal (ProposalMessage / ExternalJoinProposalMessage) before storing it.
 /// Same coverage as a commit's proposals: Add/Update leaves AS-validated, GCE downgrade-checked.
+/// A1: EXHAUSTIVE MATCH по типу предложения, без `_`. Исходы — ровно прежние (до A1 всё, кроме
+/// Add/Update/GCE, проходило подстановочной веткой `_ => Ok(())`): Remove/PSK/ReInit/ExternalInit/
+/// SelfRemove/Custom не несут листа и здесь не валидируются — их СУДЬБУ решает dispatch (B8: ни одно
+/// входящее предложение не сохраняется). Менять исход здесь — отдельное решение владельца (A1-план
+/// §7 п.3, взят безопасный вариант: только перечисление). Новый вариант в OpenMLS — ошибка сборки.
 pub fn validate_queued_proposal(p: &Proposal, ts: &TrustStore) -> Result<(), CommitReject> {
     match p {
         Proposal::Add(add) => validate_leafnode(add.key_package().leaf_node(), ts).map_err(CommitReject::Leaf),
@@ -210,7 +234,12 @@ pub fn validate_queued_proposal(p: &Proposal, ts: &TrustStore) -> Result<(), Com
             Some(rc) => check_no_downgrade(rc).map_err(CommitReject::Downgrade),
             None => Err(CommitReject::Downgrade(DowngradeReject::MissingRequiredExtension(KVANT_DEVCERT_EXT))),
         },
-        _ => Ok(()),
+        Proposal::Remove(_remove) => Ok(()),            // листа нет; отбрасывает B8 в dispatch
+        Proposal::PreSharedKey(_psk) => Ok(()),         // листа нет; отбрасывает B8 в dispatch
+        Proposal::ReInit(_reinit) => Ok(()),            // листа нет; отбрасывает B8 в dispatch
+        Proposal::ExternalInit(_ext) => Ok(()),         // листа нет; отбрасывает B8 в dispatch
+        Proposal::SelfRemove => Ok(()),                 // листа нет; отбрасывает B8 в dispatch
+        Proposal::Custom(_custom) => Ok(()),            // листа нет; отбрасывает B8 в dispatch
     }
 }
 

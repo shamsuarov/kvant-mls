@@ -13,6 +13,7 @@ use crate::devicecert::CertReject;
 use ed25519_dalek::SigningKey;
 use openmls::prelude::tls_codec::Serialize as _;
 use openmls_libcrux_crypto::Provider as LibcruxProvider;
+use openmls_basic_credential::SignatureKeyPair;
 use sha2::{Digest, Sha256};
 
 fn wire(m: &MlsMessageOut) -> Vec<u8> {
@@ -605,3 +606,170 @@ fn rejected_welcome_does_not_burn_the_keypackage() {
         r2.err()
     );
 }
+
+// ---------------- A1: stage/commit Welcome ----------------
+//
+// Приёмка A1 (2026-10-11): export_secret совпадает (прямой join vs stage→commit — оба равны секрету
+// владельца группы, то есть key schedule один), stage не оставляет группы в хранилище, KeyPackage
+// после stage жив при любом исходе, discard его сжигает, commit после ушедшей вперёд группы догоняет.
+
+/// Как build_join, но отдаёт и сторону владельца: нужна для сравнения секретов и для коммитов после Welcome.
+fn build_join_full(joiner_acc: &SigningKey, joiner_id: &[u8], create_cfg: &MlsGroupCreateConfig)
+    -> (LibcruxProvider, MlsGroup, SignatureKeyPair, LibcruxProvider, Welcome, RatchetTreeIn) {
+    let ap = provider();
+    let (asig, acwk) = party(&ap, &sk(1), b"alice");
+    let mut agroup = MlsGroup::new(&ap, &asig, create_cfg, acwk).unwrap();
+    let jp = provider();
+    let (jsig, jcwk) = party(&jp, joiner_acc, joiner_id);
+    let jkp = key_package(&jp, &jsig, jcwk);
+    let (_c, welcome, _g) = agroup.add_members(&ap, &asig, &[jkp]).unwrap();
+    agroup.merge_pending_commit(&ap).unwrap();
+    let w = match welcome.body() {
+        MlsMessageBodyOut::Welcome(w) => w.clone(),
+        _ => panic!("no welcome"),
+    };
+    let tree: RatchetTreeIn = agroup.export_ratchet_tree().into();
+    (ap, agroup, asig, jp, w, tree)
+}
+
+fn exported(g: &MlsGroup, p: &LibcruxProvider) -> Vec<u8> {
+    g.export_secret(p.crypto(), "kvant-a1-acceptance", b"ctx", 32).unwrap()
+}
+
+fn no_group_in_store(p: &LibcruxProvider, gid: &GroupId) -> bool {
+    PublicGroup::load(p.storage(), gid).unwrap().is_none() && MlsGroup::load(p.storage(), gid).unwrap().is_none()
+}
+
+#[test]
+fn a1_stage_then_commit_matches_direct_join_key_schedule() {
+    let dave = sk(4);
+    let cfg = group_config();
+    let mut ts = TrustStore::new();
+    ts.pin(b"alice", &pubk(&sk(1)));
+    ts.pin(b"dave", &pubk(&dave));
+    let (ap, mut agroup, asig, jp, w, tree) = build_join_full(&dave, b"dave", &cfg);
+    let gid = agroup.group_id().clone();
+
+    // ---- stage: проверки прошли, группы в хранилище НЕТ, KeyPackage на месте ----
+    let kp_before = jp.storage().values.read().unwrap().len();
+    let info = stage_welcome(&jp, cfg.join_config(), w.clone(), Some(tree.clone()), &ts).expect("stage");
+    assert_eq!(info.gid, gid.as_slice().to_vec());
+    assert_eq!(info.epoch, agroup.epoch().as_u64());
+    assert_eq!(info.ciphersuite, u16::from(CS));
+    assert_eq!(info.sender_account_id, b"alice".to_vec());
+    assert_eq!(info.sender_leaf_origin, LeafOrigin::Commit, "владелец создал группу — его лист обновлён коммитом Add");
+    let mut ids: Vec<Vec<u8>> = info.members.iter().map(|l| l.account_id.clone()).collect();
+    ids.sort();
+    assert_eq!(ids, vec![b"alice".to_vec(), b"dave".to_vec()], "состав карточки — из проверенного дерева");
+    assert!(no_group_in_store(&jp, &gid), "🔴 после stage в хранилище нет ни PublicGroup, ни MlsGroup");
+    assert_eq!(jp.storage().values.read().unwrap().len(), kp_before, "🔴 хранилище после stage = до stage (KeyPackage возвращён)");
+    // stage повторяем (перезапуск приложения → stage из тех же байтов)
+    let info2 = stage_welcome(&jp, cfg.join_config(), w.clone(), Some(tree.clone()), &ts).expect("stage twice");
+    assert_eq!(info2, info);
+    assert!(no_group_in_store(&jp, &gid));
+
+    // ---- commit = dispatch_welcome от тех же байтов ----
+    let mut g = dispatch_welcome(&jp, cfg.join_config(), w, Some(tree), &ts).expect("commit after stage");
+    assert_eq!(g.epoch(), agroup.epoch());
+    // 🔴 ПРИЁМКА: export_secret stage→commit == секрет владельца (один key schedule)
+    assert_eq!(exported(&g, &jp), exported(&agroup, &ap), "export_secret: stage→commit ≠ владелец");
+    assert_eq!(g.epoch_authenticator().as_slice(), agroup.epoch_authenticator().as_slice());
+    // и прикладное сообщение владельца читается
+    let msg = agroup.create_message(&ap, &asig, b"after-commit").unwrap();
+    let d = dispatch_group_message(&mut g, &jp, &wire(&msg), &ts, None).expect("app message");
+    assert!(matches!(d, Disposition::Application(ref pt) if pt == b"after-commit"));
+
+    // ---- контроль: ПРЯМОЙ join (как до A1) даёт тот же секрет владельца на своей эпохе ----
+    let erin = sk(5);
+    ts.pin(b"erin", &pubk(&erin));
+    let ep = provider();
+    let (esig, ecwk) = party(&ep, &erin, b"erin");
+    let ekp = key_package(&ep, &esig, ecwk);
+    let (commit, welcome2, _gi) = agroup.add_members(&ap, &asig, &[ekp]).unwrap();
+    agroup.merge_pending_commit(&ap).unwrap();
+    let w2 = match welcome2.body() { MlsMessageBodyOut::Welcome(w) => w.clone(), _ => panic!("no welcome") };
+    let g2 = dispatch_welcome(&ep, cfg.join_config(), w2, Some(agroup.export_ratchet_tree().into()), &ts).expect("direct join");
+    assert_eq!(exported(&g2, &ep), exported(&agroup, &ap), "export_secret: прямой join ≠ владелец");
+    // dave догоняет коммит Add(erin) — и все трое на одном секрете
+    let d = dispatch_group_message(&mut g, &jp, &wire(&commit), &ts, None).expect("dave merges add(erin)");
+    assert!(matches!(d, Disposition::CommitMerged));
+    assert_eq!(exported(&g, &jp), exported(&g2, &ep), "stage→commit и прямой join расходятся после общего коммита");
+}
+
+#[test]
+fn a1_stage_reject_keeps_keypackage_then_commit_passes() {
+    // Отказ stage (владелец не запинен → UnknownAccount) не сжигает KeyPackage: после того как
+    // пин появился, тот же Welcome вступает. До A1 отказ ПОСЛЕ build_from_welcome съедал KeyPackage.
+    let dave = sk(4);
+    let cfg = group_config();
+    let (ap, agroup, _asig, jp, w, tree) = build_join_full(&dave, b"dave", &cfg);
+    let mut ts = TrustStore::new();
+    ts.pin(b"dave", &pubk(&dave)); // alice НЕ запинена
+    let r = stage_welcome(&jp, cfg.join_config(), w.clone(), Some(tree.clone()), &ts);
+    assert!(matches!(r, Err(DispatchReject::Leaf(LeafReject::UnknownAccount))), "{:?}", r.err());
+    assert!(no_group_in_store(&jp, agroup.group_id()));
+    ts.pin(b"alice", &pubk(&sk(1)));
+    let g = dispatch_welcome(&jp, cfg.join_config(), w, Some(tree), &ts)
+        .expect("🔴 KeyPackage обязан пережить отказ stage: NoMatchingKeyPackage здесь = исчерпание");
+    assert_eq!(exported(&g, &jp), exported(&agroup, &ap));
+}
+
+#[test]
+fn a1_discard_burns_keypackage_commit_impossible() {
+    let dave = sk(4);
+    let cfg = group_config();
+    let (_ap, agroup, _asig, jp, w, tree) = build_join_full(&dave, b"dave", &cfg);
+    let mut ts = TrustStore::new();
+    ts.pin(b"alice", &pubk(&sk(1)));
+    ts.pin(b"dave", &pubk(&dave));
+    stage_welcome(&jp, cfg.join_config(), w.clone(), Some(tree.clone()), &ts).expect("stage");
+    assert_eq!(burn_welcome_key_package(&jp, &w).unwrap(), 1, "ровно один одноразовый KeyPackage сожжён");
+    assert_eq!(burn_welcome_key_package(&jp, &w).unwrap(), 0, "повторный discard — нечего");
+    let r = dispatch_welcome(&jp, cfg.join_config(), w.clone(), Some(tree.clone()), &ts);
+    assert!(r.is_err(), "после discard вступить нельзя (init-ключ отказ не переживает)");
+    assert!(no_group_in_store(&jp, agroup.group_id()));
+    let r2 = stage_welcome(&jp, cfg.join_config(), w, Some(tree), &ts);
+    assert!(r2.is_err(), "и stage после discard невозможен");
+}
+
+#[test]
+fn a1_commit_after_group_advanced_catches_up() {
+    // Между Welcome и «Принять» владелец сделал коммит. stage видит эпоху Welcome; commit вступает на
+    // ней; буферизованный коммит проигрывается — эпохи и секреты сходятся.
+    let dave = sk(4);
+    let cfg = group_config();
+    let mut ts = TrustStore::new();
+    ts.pin(b"alice", &pubk(&sk(1)));
+    ts.pin(b"dave", &pubk(&dave));
+    let (ap, mut agroup, asig, jp, w, tree) = build_join_full(&dave, b"dave", &cfg);
+    let welcome_epoch = agroup.epoch().as_u64();
+    let (upd, _w, _gi) = agroup.self_update(&ap, &asig, LeafNodeParameters::default()).unwrap().into_contents();
+    agroup.merge_pending_commit(&ap).unwrap();
+    assert_eq!(agroup.epoch().as_u64(), welcome_epoch + 1);
+
+    let info = stage_welcome(&jp, cfg.join_config(), w.clone(), Some(tree.clone()), &ts).expect("stage");
+    assert_eq!(info.epoch, welcome_epoch, "stage говорит эпоху Welcome, не текущую");
+    let mut g = dispatch_welcome(&jp, cfg.join_config(), w, Some(tree), &ts).expect("commit");
+    assert_eq!(g.epoch().as_u64(), welcome_epoch);
+    let d = dispatch_group_message(&mut g, &jp, &wire(&upd), &ts, None).expect("replay buffered commit");
+    assert!(matches!(d, Disposition::CommitMerged));
+    assert_eq!(g.epoch(), agroup.epoch());
+    assert_eq!(exported(&g, &jp), exported(&agroup, &ap), "после догона секреты сходятся");
+}
+
+#[test]
+fn a1_stage_after_join_refused_and_live_group_untouched() {
+    let dave = sk(4);
+    let cfg = group_config();
+    let mut ts = TrustStore::new();
+    ts.pin(b"alice", &pubk(&sk(1)));
+    ts.pin(b"dave", &pubk(&dave));
+    let (_ap, _agroup, _asig, jp, w, tree) = build_join_full(&dave, b"dave", &cfg);
+    let g = dispatch_welcome(&jp, cfg.join_config(), w.clone(), Some(tree.clone()), &ts).expect("join");
+    let fp = group_state_fp(&g);
+    let r = stage_welcome(&jp, cfg.join_config(), w, Some(tree), &ts);
+    assert!(r.is_err(), "повторный stage в живую группу — отказ");
+    let g2 = MlsGroup::load(jp.storage(), g.group_id()).unwrap().expect("живая группа на месте");
+    assert_eq!(group_state_fp(&g2), fp, "живая группа не тронута");
+}
+
