@@ -980,6 +980,13 @@ pub mod fuzz {
         let gid = alice.create_group().unwrap();
         let add = alice.add_member(gid.clone(), bob.make_key_package().unwrap()).unwrap();
         if bob.join_from_welcome(add.welcome, add.ratchet_tree).is_err() { return; }
+        // KV-03-001: roles on EVERY member that processes commits — exactly as the app (mlsWiring re-feeds
+        // the owner-signed chain on start). Without them a removal by alice is refused by bob/carol
+        // ("roles not arrived yet") and the member sets legitimately diverge — a stale-harness alarm, not
+        // a crate bug (found 2026-10-11 by the A1 campaign, crash-dd355b30…).
+        for c in [&alice, &bob, &carol] {
+            c.set_group_roles(gid.clone(), a_id.clone(), vec![]);
+        }
 
         let mut carol_in = false;
         let mut carol_last_removed_epoch_msg: Option<Vec<u8>> = None;
