@@ -119,7 +119,10 @@ check('КОНТРОЛЬ: Cargo.lock прочитан', /\[\[package\]\]/.test(lo
   const calls = (dispatch.match(/StagedWelcome::build_from_welcome/g) || []).length;
   check('🔴 build_from_welcome вызывается РОВНО ОДИН раз — второй вход обошёл бы отбраковку',
     calls === 1, `${calls} вызов(ов)`);
-  const body = dispatch.slice(dispatch.indexOf('pub fn dispatch_welcome'));
+  // A1 (stage/commit, 2026-10-11): цепочка проверок Welcome живёт в welcome_checks — ОДНА на stage и commit
+  // (dispatch_welcome = welcome_checks + into_group). Якорь — на неё; «ровно один build_from_welcome» выше
+  // по-прежнему считается по всему файлу.
+  const body = dispatch.slice(dispatch.indexOf('fn welcome_checks'));
   const iGuard = body.indexOf('assert_ciphersuite(');
   const iBuild = body.indexOf('StagedWelcome::build_from_welcome');
   check('🔴 и отбраковка стоит ДО него — после неё KeyPackage уже потреблён',
