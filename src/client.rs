@@ -1024,22 +1024,29 @@ pub mod fuzz {
                             let g = carol.inner.lock().unwrap();
                             (g.provider.storage().counters.frozen_writes(), g.provider.storage().key_package_keys().len())
                         };
+                        // Stage may legitimately REFUSE (B6.2: carol was removed but never told — op 3 does
+                        // not feed her the removal commit — so her local group is still LIVE and a new Welcome
+                        // is refused, exactly as join refuses it). The A1 invariant is therefore relational:
+                        // stage Ok ⇔ commit Ok (same checks), never "stage always Ok".
+                        let had_group = carol.member_account_ids(gid.clone()).is_ok();
                         let s1 = carol.stage_welcome(add.welcome.clone(), add.ratchet_tree.clone());
-                        assert!(s1.is_ok(), "A1: stage of a GENUINE welcome refused: {:?}", s1.err());
                         let s2 = carol.stage_welcome(add.welcome.clone(), add.ratchet_tree.clone());
-                        assert!(s2.is_ok(), "A1: second stage refused (stage must be repeatable)");
+                        assert_eq!(s1.is_ok(), s2.is_ok(), "A1: stage is not repeatable (verdict changed between two stages)");
                         {
                             let g = carol.inner.lock().unwrap();
                             assert_eq!(g.provider.storage().counters.frozen_writes(), fw, "A1: stage wrote FROZEN state");
                             assert_eq!(g.provider.storage().key_package_keys().len(), kps, "A1: stage changed the KeyPackage pool");
                         }
-                        assert!(carol.member_account_ids(gid.clone()).is_err(), "A1: stage created a group");
+                        assert_eq!(carol.member_account_ids(gid.clone()).is_ok(), had_group, "A1: stage created or destroyed a group");
                         let _ = bob.process_incoming(gid.clone(), add.commit);
-                        assert!(carol.join_from_welcome(add.welcome, add.ratchet_tree).is_ok(), "A1: commit after stage failed (KeyPackage burned?)");
-                        carol_in = true;
-                        let am = sorted(alice.member_account_ids(gid.clone()).unwrap());
-                        let cm = sorted(carol.member_account_ids(gid.clone()).unwrap());
-                        assert_eq!(am, cm, "alice/carol disagree on members after stage→commit");
+                        let joined = carol.join_from_welcome(add.welcome, add.ratchet_tree).is_ok();
+                        assert_eq!(s1.is_ok(), joined, "A1: stage verdict ≠ commit verdict (stage Ok={}, commit Ok={})", s1.is_ok(), joined);
+                        if joined {
+                            carol_in = true;
+                            let am = sorted(alice.member_account_ids(gid.clone()).unwrap());
+                            let cm = sorted(carol.member_account_ids(gid.clone()).unwrap());
+                            assert_eq!(am, cm, "alice/carol disagree on members after stage→commit");
+                        }
                     }
                 }
                 3 if carol_in => {
