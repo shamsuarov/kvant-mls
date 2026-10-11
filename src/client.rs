@@ -938,7 +938,7 @@ pub mod fuzz {
         let group = groups.get_mut(&fx.gid).unwrap();
         let fp_before = group_state_fp(group);
         // UNGUARDED on purpose — a panic here is a real libcrux/OpenMLS crash for ASAN to catch.
-        match dispatch_group_message(group, &*provider, wire, &*ts) {
+        match dispatch_group_message(group, &*provider, wire, &*ts, None) {
             Ok(_) => { /* Ok may legitimately advance state (a valid commit merges) — no invariant */ }
             Err(_) => {
                 let fp_after = group_state_fp(group);
