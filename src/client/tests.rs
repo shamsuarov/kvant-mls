@@ -976,3 +976,26 @@ fn a1_not_a_welcome_named_by_body_type() {
     assert!(format!("{e:?}").contains("not a welcome: PrivateMessage"), "{e:?}");
 }
 
+#[test]
+fn a1_stage_keeps_evicted_husk_commit_replaces_it() {
+    // B6.2 на двух точках: удалённый из группы bob (мёртвый остов в хранилище) получает Welcome заново.
+    // stage: проверки проходят, остов НЕ тронут (stage не меняет хранилище). commit: остов снят, вступление.
+    let (alice, bob, gid, _, (b_id, _b_pub)) = two_member_group();
+    let commit = alice.remove_member(gid.clone(), b_id.clone()).unwrap();
+    alice.merge_pending(gid.clone()).unwrap();
+    let _ = bob.process_incoming(gid.clone(), commit); // bob узнаёт, что удалён → группа неактивна
+    let fw = frozen_writes(&bob);
+    let add = alice.add_member(gid.clone(), bob.make_key_package().unwrap()).unwrap();
+    let info = bob.stage_welcome(add.welcome.clone(), add.ratchet_tree.clone()).expect("stage поверх мёртвого остова");
+    assert_eq!(info.gid, gid);
+    assert_eq!(frozen_writes(&bob), fw, "🔴 stage не трогает остов (FROZEN-записей нет)");
+    {
+        let g = bob.inner.lock().unwrap();
+        let husk = MlsGroup::load(g.provider.storage(), &GroupId::from_slice(&gid)).unwrap();
+        assert!(matches!(husk, Some(ref h) if !h.is_active()), "остов на месте и неактивен после stage");
+    }
+    assert_eq!(bob.join_from_welcome(add.welcome, add.ratchet_tree).unwrap(), gid, "commit заменяет остов");
+    let wire = alice.encrypt_message(gid.clone(), b"back".to_vec()).unwrap();
+    assert_eq!(bob.process_incoming(gid, wire).unwrap().plaintext.as_deref(), Some(&b"back"[..]));
+}
+

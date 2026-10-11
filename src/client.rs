@@ -1045,6 +1045,11 @@ pub mod fuzz {
                 3 if carol_in => {
                     // alice removes carol → bob applies; a NEW-epoch message must be UNREADABLE to carol (PCS)
                     if let Ok(commit) = alice.remove_member(gid.clone(), c_id.clone()) {
+                        // remove_member leaves the author's commit PENDING (multi-admin races, see
+                        // remove_member) — the app confirms it with merge_pending; the harness does the same,
+                        // or alice never leaves the epoch and the "post-removal" message below is at the OLD
+                        // epoch (a stale-harness false PCS alarm, found 2026-10-11 by the A1 campaign).
+                        if alice.merge_pending(gid.clone()).is_err() { continue; }
                         let _ = bob.process_incoming(gid.clone(), commit);
                         carol_in = false;
                         if let Ok(w) = alice.encrypt_message(gid.clone(), b"secret".to_vec()) {

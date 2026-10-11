@@ -232,12 +232,16 @@ pub fn dispatch_group_message<P: OpenMlsProvider>(
 /// ОДНА цепочка проверок, а не две похожие: §10.11 шифронабор до OpenMLS → build_from_welcome →
 /// B6.2 живая/мёртвая группа → дерево → build() → пол capability → обход всего дерева (B1.3).
 /// Возвращает StagedWelcome: в памяти, в хранилище группы ещё нет.
+/// `commit` — это реальное вступление (dispatch_welcome): только тогда B6.2 удаляет мёртвый остов
+/// прежней группы перед заменой. На stage остов НЕ трогается (stage не меняет хранилище), а сборка
+/// идёт через replace_old_group — флаг лишь снимает проверку существования, удаление отдельно.
 fn welcome_checks<P: OpenMlsProvider>(
     provider: &P,
     join_config: &MlsGroupJoinConfig,
     welcome: Welcome,
     ratchet_tree: Option<RatchetTreeIn>,
     ts: &TrustStore,
+    commit: bool,
 ) -> Result<StagedWelcome, DispatchReject> {
     // B6.2 — RE-JOINING A GROUP WE WERE EVICTED FROM.
     //
@@ -298,11 +302,13 @@ fn welcome_checks<P: OpenMlsProvider>(
     let jb = match (present, evicted) {
         (false, _) => jb,
         (true, true) => {
-            let mut old = MlsGroup::load(provider.storage(), &gid)
-                .map_err(|e| DispatchReject::Apply(format!("{e:?}")))?
-                .ok_or_else(|| DispatchReject::Apply("evicted group vanished between reads".into()))?;
-            old.delete(provider.storage())
-                .map_err(|e| DispatchReject::Apply(format!("{e:?}")))?;
+            if commit {
+                let mut old = MlsGroup::load(provider.storage(), &gid)
+                    .map_err(|e| DispatchReject::Apply(format!("{e:?}")))?
+                    .ok_or_else(|| DispatchReject::Apply("evicted group vanished between reads".into()))?;
+                old.delete(provider.storage())
+                    .map_err(|e| DispatchReject::Apply(format!("{e:?}")))?;
+            }
             jb.replace_old_group()
         }
         // The crate has no logger, so the branches name themselves where they can be READ: this one
@@ -343,7 +349,7 @@ pub fn dispatch_welcome<P: OpenMlsProvider>(
     ratchet_tree: Option<RatchetTreeIn>,
     ts: &TrustStore,
 ) -> Result<MlsGroup, DispatchReject> {
-    welcome_checks(provider, join_config, welcome, ratchet_tree, ts)?
+    welcome_checks(provider, join_config, welcome, ratchet_tree, ts, true)?
         .into_group(provider)
         .map_err(|e| DispatchReject::Apply(format!("{e:?}")))
 }
@@ -458,7 +464,7 @@ pub fn stage_welcome<P: OpenMlsProvider>(
     ts: &TrustStore,
 ) -> Result<StagedInfo, DispatchReject> {
     let mine = own_key_packages_for(provider, &welcome)?;
-    let res = welcome_checks(provider, join_config, welcome, ratchet_tree, ts).and_then(|staged| staged_info(&staged));
+    let res = welcome_checks(provider, join_config, welcome, ratchet_tree, ts, false).and_then(|staged| staged_info(&staged));
     // ВСЕГДА, при любом исходе: stage обязан оставить хранилище KeyPackage таким, каким нашёл.
     for (r, b) in &mine {
         provider
