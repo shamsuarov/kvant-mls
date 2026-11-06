@@ -766,15 +766,19 @@ fn prune_shrinks_state_and_keeps_live_groups_working() {
         let _ = alice.encrypt_message(g.clone(), b"x".to_vec()).unwrap();
         dead.push(g);
     }
-    for _ in 0..5 {
+    for _ in 0..8 {
         let _ = alice.make_key_packages(10).unwrap(); // СТАРЫЙ путь: поколения копятся
     }
     let (fat_bytes, fat_keys) = state_size(&alice);
     assert!(fat_keys > 100, "контроль: состояние действительно раздулось — ключей {fat_keys}");
 
     // ── ОБРЕЗКА 1: поколения пула ───────────────────────────────────────────────────────────
+    // KP-GEN-96: первая ротация на неразмеченном состоянии ничего не снимает (всё, что есть,
+    // становится «прежним» поколением), снимает — вторая. См. rotate_first_run_on_legacy_state_*.
     let fresh = alice.rotate_key_packages(10).unwrap();
     assert_eq!(fresh.len(), 10, "новый пул выдан целиком");
+    let fresh = alice.rotate_key_packages(10).unwrap();
+    assert_eq!(fresh.len(), 10, "второй новый пул выдан целиком");
     let (after_kp, _) = state_size(&alice);
     assert!(after_kp < fat_bytes, "ротация пула обязана уменьшить состояние: {fat_bytes} → {after_kp}");
 
@@ -999,3 +1003,106 @@ fn a1_stage_keeps_evicted_husk_commit_replaces_it() {
     assert_eq!(bob.process_incoming(gid, wire).unwrap().plaintext.as_deref(), Some(&b"back"[..]));
 }
 
+
+// ═══ KP-GEN-96: РОТАЦИЯ ХРАНИТ РОВНО ОДНО ПРЕЖНЕЕ ПОКОЛЕНИЕ KeyPackage ═══════════════════════
+//
+// ОТКУДА. A-MLS-PRUNE §7.2 — названный долг: ротация снимала прежнее поколение сразу, и Welcome,
+// выписанный на KeyPackage ДО реконнекта (он лежит в офлайн-очереди сервера), после реконнекта
+// открыть было нечем — NoMatchingKeyPackage, терминально. Поле 05.11 («Kvant» в «Тест 500»):
+// повторное добавление и ротация в одном окне. Решение владельца 06.11: править крейт.
+//
+// ПРАВИЛО. Ротация N снимает ТОЛЬКО поколение, которое на ротации N-1 уже было «прежним», и
+// оставляет всё, что появилось между N-1 и N (пул, last-resort, доливки). То есть в хранилище
+// живут не более двух поколений, и Welcome переживает ровно один реконнект между выдачей KP и
+// своим приходом — больше ему и не нужно: сервер заменяет пул на каждой публикации.
+
+/// Владелец `alice` зовёт `bob` по данному KeyPackage в НОВУЮ группу; Welcome не разбирается —
+/// он «лежит у сервера». Возвращает (welcome, ratchet_tree, gid).
+fn pending_invite(alice: &MlsClient, kp: Vec<u8>) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let gid = alice.create_group().unwrap();
+    let add = alice.add_member(gid.clone(), kp).unwrap();
+    (add.welcome, add.ratchet_tree, gid)
+}
+
+fn pinned_pair() -> (Arc<MlsClient>, Arc<MlsClient>) {
+    let (alice, a_id, a_pub) = mk(1, 2, b"alice");
+    let (bob, b_id, b_pub) = mk(3, 4, b"bob");
+    alice.pin_account(b_id, b_pub);
+    bob.pin_account(a_id, a_pub);
+    (alice, bob)
+}
+
+#[test]
+fn rotate_keeps_exactly_one_previous_generation() {
+    let (alice, bob) = pinned_pair();
+
+    // Поколение 1 (как в приложении: пул ротацией + last-resort следом).
+    let gen1 = bob.rotate_key_packages(3).unwrap();
+    let lr1 = bob.make_last_resort_key_package().unwrap();
+    // Три Welcome на поколение 1 выписаны и ЛЕЖАТ У СЕРВЕРА.
+    let (w1a, t1a, g1a) = pending_invite(&alice, gen1[0].clone());
+    let (w1b, t1b, _g1b) = pending_invite(&alice, gen1[1].clone());
+    let (wlr, tlr, glr) = pending_invite(&alice, lr1);
+
+    // Реконнект → ротация (поколение 2). Поколение 1 обязано остаться целиком.
+    let gen2 = bob.rotate_key_packages(3).unwrap();
+    assert_eq!(bob.join_from_welcome(w1a, t1a).unwrap(), g1a, "🔴 Welcome на KP прежнего поколения открывается после ОДНОЙ ротации");
+    assert_eq!(bob.join_from_welcome(wlr, tlr).unwrap(), glr, "🔴 last-resort прежнего поколения тоже жив после одной ротации");
+    let (w2, t2, g2) = pending_invite(&alice, gen2[0].clone());
+
+    // Ещё реконнект → ротация (поколение 3): поколение 1 снято, поколение 2 осталось.
+    let _gen3 = bob.rotate_key_packages(3).unwrap();
+    assert!(bob.join_from_welcome(w1b, t1b).is_err(), "🔴 ровно ОДНО прежнее поколение: поза-прошлое снято");
+    assert_eq!(bob.join_from_welcome(w2, t2).unwrap(), g2, "поколение 2 — прежнее для ротации 3 — живо");
+}
+
+#[test]
+fn rotate_generations_are_bounded_in_storage() {
+    let (_alice, bob) = pinned_pair();
+    // Разогрев до установившегося режима, затем замер: дальнейшие ротации размер НЕ растят.
+    for _ in 0..3 { bob.rotate_key_packages(10).unwrap(); bob.make_last_resort_key_package().unwrap(); }
+    let steady = bob.state_footprint().keys;
+    for _ in 0..5 { bob.rotate_key_packages(10).unwrap(); bob.make_last_resort_key_package().unwrap(); }
+    assert_eq!(bob.state_footprint().keys, steady, "🔴 установившийся режим: ротация не копит поколения (ключей {steady})");
+    // И это именно ДВА поколения (пул 10 + last-resort), а не «всё что было»: < 3 поколений + служебные записи.
+    assert!(steady < 3 * 11 + 8, "в хранилище не больше двух поколений: ключей {steady}");
+    assert!(steady >= 2 * 11, "и не меньше двух (прежнее поколение хранится): ключей {steady}");
+}
+
+#[test]
+fn rotate_previous_generation_survives_restart() {
+    let (alice, bob) = pinned_pair();
+    let gen1 = bob.rotate_key_packages(2).unwrap();
+    let (w1a, t1a, g1a) = pending_invite(&alice, gen1[0].clone());
+    let (w1b, t1b, _) = pending_invite(&alice, gen1[1].clone());
+
+    // Перезапуск приложения: состояние экспортировано и поднято НОВЫМ клиентом той же личности.
+    let blob = bob.export_state().unwrap();
+    let (bob2, _, _) = mk(3, 4, b"bob");
+    let (_, a_id, a_pub) = mk(1, 2, b"alice");
+    bob2.pin_account(a_id, a_pub);
+    bob2.import_state(blob).unwrap();
+
+    // Первая ротация после перезапуска — поколение 1 становится «прежним» и остаётся.
+    bob2.rotate_key_packages(2).unwrap();
+    assert_eq!(bob2.join_from_welcome(w1a, t1a).unwrap(), g1a, "🔴 разметка поколений переживает перезапуск: Welcome на KP до перезапуска открывается");
+    // Вторая — снимает его.
+    bob2.rotate_key_packages(2).unwrap();
+    assert!(bob2.join_from_welcome(w1b, t1b).is_err(), "после двух ротаций поколение 1 снято и у перезапущенного клиента");
+}
+
+#[test]
+fn rotate_first_run_on_legacy_state_drops_nothing() {
+    // Состояние со сборки ≤95: поколения не размечены. Первая ротация 96 обязана быть
+    // консервативной — ничего не снимать (всё, что есть, становится «прежним»), снять — на второй.
+    let (alice, bob) = pinned_pair();
+    let old_pool = bob.make_key_packages(2).unwrap(); // как строил ≤95 без разметки
+    let (w, t, g) = pending_invite(&alice, old_pool[0].clone());
+    let (w2, t2, _) = pending_invite(&alice, old_pool[1].clone());
+    let before = bob.state_footprint().keys;
+    bob.rotate_key_packages(2).unwrap();
+    assert!(bob.state_footprint().keys > before, "первая ротация без разметки ничего не снимает");
+    assert_eq!(bob.join_from_welcome(w, t).unwrap(), g, "🔴 Welcome на неразмеченное поколение открывается после первой ротации 96");
+    bob.rotate_key_packages(2).unwrap();
+    assert!(bob.join_from_welcome(w2, t2).is_err(), "вторая ротация снимает неразмеченное поколение");
+}

@@ -222,6 +222,11 @@ const OWN_LEAF_NODE_INDEX_LABEL: &[u8] = b"OwnLeafNodeIndex";
 const EPOCH_SECRETS_LABEL: &[u8] = b"EpochSecrets";
 const RESUMPTION_PSK_STORE_LABEL: &[u8] = b"ResumptionPsk";
 const MESSAGE_SECRETS_LABEL: &[u8] = b"MessageSecrets";
+// KP-GEN-96 (A-MLS-PRUNE §7.2): СВОЯ метка крейта, не OpenMLS. Под ней одна запись — список ключей
+// KeyPackage, составляющих ПРЕЖНЕЕ поколение пула (то, что снимет следующая ротация). Значение
+// запечатано KSE1, как и всё остальное; ключи KeyPackage сами по себе не секрет (метка + hash_ref).
+const KP_GENERATION_LABEL: &[u8] = b"KvantKpGeneration";
+const KP_GENERATION_KEY: &[u8] = b"previous";
 
 // 🟡 HARDEN 2 — the SINGLE SOURCE OF TRUTH: label → keyspace. BOTH the per-write counter tag (via
 // `keyspace_for_label`, called inside put/append/remove_item/del) AND the frozen/free rollback class (via
@@ -234,6 +239,7 @@ const LABEL_KEYSPACE: &[(&[u8], Keyspace)] = &[
     (PSK_LABEL, Keyspace::KeyMaterial),
     (ENCRYPTION_KEY_PAIR_LABEL, Keyspace::KeyMaterial),
     (SIGNATURE_KEY_PAIR_LABEL, Keyspace::KeyMaterial),
+    (KP_GENERATION_LABEL, Keyspace::KeyMaterial), // KP-GEN-96: разметка поколений пула — FREE, откат её не трогает
     // SecretRatchet (FREE — advances for forward secrecy)
     (EPOCH_KEY_PAIRS_LABEL, Keyspace::SecretRatchet),
     (EPOCH_SECRETS_LABEL, Keyspace::SecretRatchet),
@@ -935,6 +941,44 @@ impl KseStorageProvider {
         gone
     }
 
+    // ─── KP-GEN-96: ПОКОЛЕНИЯ ПУЛА KeyPackage ─────────────────────────────────────────────────
+    //
+    // A-MLS-PRUNE §7.2 закрыт: ротация снимает НЕ «всё прежнее», а только поколение, которое на
+    // ПРОШЛОЙ ротации уже было прежним. Разметка — одна запись под KP_GENERATION_LABEL: список
+    // ключей, которые следующая ротация снимет. Снимок берётся ДО постройки нового пула (как и
+    // раньше), и всё из снимка, чего нет в записи, — это поколение, выросшее с прошлой ротации
+    // (пул + last-resort + доливки): оно остаётся и становится новым содержимым записи.
+    //
+    // Инварианты: (а) в хранилище не более двух поколений (установившийся режим — ровно два);
+    // (б) Welcome, выписанный на KeyPackage, переживает один реконнект между выдачей KP и своим
+    // приходом; (в) состояние ≤95 без записи: первая ротация ничего не снимает — консервативно.
+    // Потреблённые OpenMLS записи (delete_key_package на join) в снимке отсутствуют и в расчёт
+    // не попадают — ни снимать, ни хранить их не нужно.
+
+    /// Ключи KeyPackage, помеченные прежней ротацией как «снять на следующей». Пусто, если
+    /// разметки ещё нет (состояние со сборки ≤95 или свежий клиент).
+    pub fn kp_generation_previous(&self) -> Result<Vec<Vec<u8>>, KseStorageError> {
+        let sk = build_key(KP_GENERATION_LABEL, KP_GENERATION_KEY);
+        let values = match self.values.read() { Ok(v) => v, Err(p) => p.into_inner() };
+        match values.get(&sk) {
+            Some(sealed) => Ok(serde_json::from_slice(&self.open(&sk, sealed)?)?),
+            None => Ok(vec![]),
+        }
+    }
+
+    /// Завершить ротацию: `snapshot` — ключи KeyPackage, снятые ДО постройки нового пула. Снимает
+    /// из них ровно помеченные прежней ротацией, остальное (поколение с прошлой ротации) помечает
+    /// на следующую. Возвращает (снято, оставлено прежним поколением).
+    pub fn retire_key_packages(&self, snapshot: &[Vec<u8>]) -> Result<(u32, u32), KseStorageError> {
+        let previous = self.kp_generation_previous()?;
+        let previous: std::collections::HashSet<&Vec<u8>> = previous.iter().collect();
+        let (stale, keep): (Vec<Vec<u8>>, Vec<Vec<u8>>) =
+            snapshot.iter().cloned().partition(|k| previous.contains(k));
+        let dropped = self.delete_keys(&stale);
+        self.put(KP_GENERATION_LABEL, KP_GENERATION_KEY, serde_json::to_vec(&keep)?)?;
+        Ok((dropped, keep.len() as u32))
+    }
+
     /// Сколько ключей и сырых байт сейчас в хранилище — для диагностики размера состояния с
     /// устройства, без выгрузки самого состояния наружу.
     pub fn footprint(&self) -> (u32, u64) {
@@ -1010,6 +1054,9 @@ mod harden {
         (PSK_LABEL, Keyspace::KeyMaterial),
         (ENCRYPTION_KEY_PAIR_LABEL, Keyspace::KeyMaterial),
         (SIGNATURE_KEY_PAIR_LABEL, Keyspace::KeyMaterial),
+        // KP-GEN-96: метка добавлена ПОСЛЕ harden — ручного тега у неё не было, класс назначен при
+        // введении (разметка поколений = ключевой материал, FREE: откат по отказу её не трогает).
+        (KP_GENERATION_LABEL, Keyspace::KeyMaterial),
         (EPOCH_KEY_PAIRS_LABEL, Keyspace::SecretRatchet),
         (EPOCH_SECRETS_LABEL, Keyspace::SecretRatchet),
         (RESUMPTION_PSK_STORE_LABEL, Keyspace::SecretRatchet),
