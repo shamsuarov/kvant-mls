@@ -478,16 +478,34 @@ pub fn stage_welcome<P: OpenMlsProvider>(
 /// A1 DISCARD («Отклонить»/TTL): сжечь одноразовый KeyPackage, которому адресован Welcome, — ровно
 /// тот, который сжёг бы commit. Возвращает, сколько записей снято (0 — нечего: уже сожжён, чужой
 /// Welcome, last-resort). Сам Welcome крейт не хранит — забывать нечего.
-pub fn burn_welcome_key_package<P: OpenMlsProvider>(provider: &P, welcome: &Welcome) -> Result<u32, DispatchReject> {
-    let mut n = 0u32;
-    for (r, _b) in own_key_packages_for(provider, welcome)? {
-        provider
+/// KP-GEN-96 r4: запись KeyPackage, которую СЪЕЛО БЫ вступление — первая запись secrets, чей KeyPackage у меня есть
+/// (ровно так выбирает OpenMLS keys_for_welcome, creation.rs). Last-resort OpenMLS при вступлении не удаляет — для него None.
+fn consumed_key_package_for<P: OpenMlsProvider>(provider: &P, welcome: &Welcome) -> Result<Option<KeyPackageRef>, DispatchReject> {
+    for egs in welcome.secrets() {
+        let r = egs.new_member();
+        let found: Option<KeyPackageBundle> = provider
             .storage()
-            .delete_key_package(&r)
-            .map_err(|e| DispatchReject::Apply(format!("burn key package: {e:?}")))?;
-        n += 1;
+            .key_package(&r)
+            .map_err(|e| DispatchReject::Apply(format!("{e:?}")))?;
+        if let Some(bundle) = found { return Ok(if bundle.key_package().last_resort() { None } else { Some(r) }); }
     }
-    Ok(n)
+    Ok(None)
+}
+
+// KP-GEN-96 r4 (ревью r3, LOW, воспроизведено): прежде сжигались ВСЕ мои KeyPackage, перечисленные в Welcome. Записи secrets
+// ничем не подписаны — отклонение подделки с дописанной ссылкой сжигало KeyPackage ДРУГОГО ждущего приглашения. Теперь —
+// ровно тот, что сжёг бы commit.
+pub fn burn_welcome_key_package<P: OpenMlsProvider>(provider: &P, welcome: &Welcome) -> Result<u32, DispatchReject> {
+    match consumed_key_package_for(provider, welcome)? {
+        Some(r) => {
+            provider
+                .storage()
+                .delete_key_package(&r)
+                .map_err(|e| DispatchReject::Apply(format!("burn key package: {e:?}")))?;
+            Ok(1)
+        }
+        None => Ok(0),
+    }
 }
 
 // ----------------------------- SEND side (symmetric) -------------------------

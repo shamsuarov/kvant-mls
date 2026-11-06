@@ -1248,3 +1248,35 @@ fn protect_set_is_capped() {
     assert!(held <= crate::client::MAX_PROTECTED_KEY_PACKAGES as u32 + 2 * 1 + 1,
         "🔴 защищённых ключей не больше потолка {} (+ два поколения по 1 KP + запись): над базой {}", crate::client::MAX_PROTECTED_KEY_PACKAGES, held);
 }
+
+// ═══ KP-GEN-96 r4 (ревью r3) ═══════════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn protect_skips_foreign_first_entry() {
+    // Первая запись secrets адресована ЧУЖОМУ KeyPackage (не моему), вторая — моему. Защищается мой: правило «первая
+    // запись, чей KeyPackage есть У МЕНЯ» (проверка снимком), а не «первая запись вообще» (ревью r3: без проверки
+    // снимком мутация проходила все тесты).
+    let (alice, bob) = pinned_pair();
+    let (carol, c_id, c_pub) = mk(5, 6, b"carol");
+    alice.pin_account(c_id, c_pub);
+    let gen1 = bob.rotate_key_packages(2, vec![]).unwrap();
+    let (wc, _, _) = pending_invite(&alice, carol.make_key_package().unwrap());
+    let (wb, tb, gb) = pending_invite(&alice, gen1[0].clone());
+    let forged = forge_with_extra_refs(&wc, &[wb.clone()]); // [чужая (carol), моя (bob gen1[0])]
+    for _ in 0..4 { bob.rotate_key_packages(2, vec![forged.clone()]).unwrap(); }
+    assert_eq!(bob.join_from_welcome(wb, tb).unwrap(), gb, "🔴 мой KeyPackage защищён, хотя первой стоит чужая запись");
+}
+
+#[test]
+fn discard_burns_only_the_key_package_a_join_would_consume() {
+    // «Отклонить» сжигает РОВНО тот KeyPackage, который съело бы вступление (первая своя запись), а не все мои, что
+    // перечислены в Welcome: иначе отклонение подделки с дописанной ссылкой сжигало KeyPackage ДРУГОГО ждущего
+    // приглашения (ревью r3, LOW — воспроизведено: discard возвращал 2, честный join затем падал).
+    let (alice, bob) = pinned_pair();
+    let gen1 = bob.rotate_key_packages(3, vec![]).unwrap();
+    let (wq, _, _) = pending_invite(&alice, gen1[0].clone());
+    let (wx, tx, gx) = pending_invite(&alice, gen1[1].clone());
+    let forged = forge_with_extra_refs(&wq, &[wx.clone()]);
+    assert_eq!(bob.discard_welcome(forged).unwrap(), 1, "🔴 сожжён один KeyPackage — тот, что съело бы вступление");
+    assert_eq!(bob.join_from_welcome(wx, tx).unwrap(), gx, "🔴 KeyPackage другого приглашения цел");
+}
