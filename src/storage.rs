@@ -983,7 +983,9 @@ impl KseStorageProvider {
     /// из них ровно помеченные прежней ротацией, кроме `protected`; остальное (поколение с прошлой ротации и
     /// защищённые) помечает на следующую. Возвращает (снято, оставлено прежним поколением).
     pub fn retire_key_packages(&self, snapshot: &[Vec<u8>], protected: &std::collections::HashSet<Vec<u8>>) -> Result<(u32, u32), KseStorageError> {
-        let previous = self.kp_generation_previous()?;
+        // r3 (ревью r2, LOW): нечитаемая запись (испорченное значение) роняла КАЖДУЮ ротацию уже после постройки пула —
+        // пул рос без предела. Читается как пустая (ничего не снимаем — консервативно) и ниже перезаписывается.
+        let previous = self.kp_generation_previous().unwrap_or_default();
         let previous: std::collections::HashSet<&Vec<u8>> = previous.iter().collect();
         let (stale, keep): (Vec<Vec<u8>>, Vec<Vec<u8>>) =
             snapshot.iter().cloned().partition(|k| previous.contains(k) && !protected.contains(k));
@@ -1134,6 +1136,24 @@ mod harden {
             assert_eq!(keyspace_for_label_opt(label_of_key(&key).unwrap()), Some(*ks));
             assert_eq!(is_frozen_key(&key), ks.frozen_on_reject());
         }
+    }
+}
+
+#[cfg(test)]
+mod kp_generation_r3 {
+    use super::*;
+    // KP-GEN-96 r3 (ревью r2, LOW): нечитаемая запись поколений (испорченное значение) роняла КАЖДУЮ ротацию уже после
+    // постройки нового пула — пул рос без предела, самоисцеления не было. Теперь такая запись читается как пустая
+    // (ротация ничего не снимает — консервативно) и перезаписывается.
+    #[test]
+    fn unreadable_generation_record_self_heals() {
+        let p = KseStorageProvider::new([7u8; 32]);
+        let sk = build_key(KP_GENERATION_LABEL, KP_GENERATION_KEY);
+        p.values.write().unwrap().insert(sk.clone(), b"not a KSE1 envelope".to_vec());
+        let snap = vec![build_key(KEY_PACKAGE_LABEL, b"a"), build_key(KEY_PACKAGE_LABEL, b"b")];
+        let r = p.retire_key_packages(&snap, &std::collections::HashSet::new());
+        assert_eq!(r.ok(), Some((0, 2)), "🔴 нечитаемая запись: ничего не снято, снимок помечен «прежним»");
+        assert_eq!(p.kp_generation_previous().unwrap().len(), 2, "🔴 запись перезаписана и снова читается");
     }
 }
 

@@ -139,15 +139,26 @@ pub struct MemberDevice {
 }
 
 /// A1: Welcome из провода — EXHAUSTIVE MATCH по телу сообщения, без `_`: каждый тип тела назван.
-// KP-GEN-96 r2: ключи хранилища KeyPackage, на которые адресованы перечисленные Welcome (по KeyPackageRef из
-// открытой части — welcome.secrets()[i].new_member(), как own_key_packages_for в dispatch.rs). Мусор пропускается.
-fn protected_key_package_keys(storage: &crate::storage::KseStorageProvider, welcomes: &[Vec<u8>]) -> std::collections::HashSet<Vec<u8>> {
+/// KP-GEN-96 r3: потолок KeyPackage, которые ротация держит по списку ждущих Welcome. Последняя граница против того,
+/// кто накопит у меня много карантинных Welcome: за потолком ключи снимаются по обычному правилу «два поколения».
+pub const MAX_PROTECTED_KEY_PACKAGES: usize = 64;
+
+// KP-GEN-96 r2/r3: ключи хранилища KeyPackage, которые ротация не снимает. НА WELCOME — НЕ БОЛЬШЕ ОДНОГО: первая запись
+// secrets, для которой KeyPackage у меня ЕСТЬ (снимок ротации), — ровно та, что возьмёт OpenMLS при вступлении
+// (keys_for_welcome, creation.rs). Остальные записи ничем не подписаны и ни к чему не привязаны: в r2 защищались все, и
+// чужой Welcome с дописанными ссылками на собранные отправителем мои KeyPackage держал их все — состояние росло на ~11 KP
+// за реконнект (ревью r2, HIGH; дверь A-MLS-PRUNE). Разбор — под guard(): байты чужие, паника не должна отравить замок
+// клиента. Мусор пропускается, потолок — MAX_PROTECTED_KEY_PACKAGES.
+fn protected_key_package_keys(storage: &crate::storage::KseStorageProvider, welcomes: &[Vec<u8>], snapshot: &[Vec<u8>]) -> std::collections::HashSet<Vec<u8>> {
+    let have: std::collections::HashSet<&Vec<u8>> = snapshot.iter().collect();
     let mut out = std::collections::HashSet::new();
     for w in welcomes {
-        let Ok(welcome) = welcome_of(w) else { continue };
+        if out.len() >= MAX_PROTECTED_KEY_PACKAGES { break; }
+        let Ok(welcome) = guard("protect_welcome", || welcome_of(w)) else { continue };
         for egs in welcome.secrets() {
             let r = egs.new_member();
-            if let Ok(k) = storage.key_package_storage_key(&r) { out.insert(k); }
+            let Ok(k) = storage.key_package_storage_key(&r) else { continue };
+            if have.contains(&k) { out.insert(k); break; }
         }
     }
     out
@@ -624,11 +635,12 @@ impl MlsClient {
     ///
     /// `protect_welcomes` (r2) — сырые Welcome (MlsMessage wire), которые приложение ещё держит: карантин A1
     /// («Принять/Отклонить») и отложенные RETRY. KeyPackage, на которые они адресованы, не снимаются, пока их
-    /// перечисляют. Неразбираемые записи пропускаются — список собран из чужих байтов и ротацию не роняет.
+    /// перечисляют — не больше одного KeyPackage на Welcome (тот, что съест вступление) и не больше
+    /// MAX_PROTECTED_KEY_PACKAGES всего (r3). Неразбираемые записи пропускаются — список собран из чужих байтов.
     pub fn rotate_key_packages(&self, count: u32, protect_welcomes: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>, MlsError> {
         let g = self.inner.lock().unwrap();
-        let protected = protected_key_package_keys(g.provider.storage(), &protect_welcomes);
         let before = g.provider.storage().key_package_keys();
+        let protected = protected_key_package_keys(g.provider.storage(), &protect_welcomes, &before);
         let mut out = Vec::with_capacity(count as usize);
         for _ in 0..count {
             let bundle = KeyPackage::builder()

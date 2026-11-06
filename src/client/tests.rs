@@ -1176,3 +1176,75 @@ fn rotate_protection_does_not_grow_storage() {
     for _ in 0..6 { bob.rotate_key_packages(10, vec![w.clone()]).unwrap(); bob.make_last_resort_key_package().unwrap(); }
     assert_eq!(bob.state_footprint().keys - base, 2 * 11 + 1 + 1, "🔴 под защитой: два поколения + один защищённый KeyPackage + запись разметки");
 }
+
+// ═══ KP-GEN-96 r3: защита — не больше одного KeyPackage на Welcome, с потолком ═══════════════════════════════════
+//
+// ОТКУДА (ревью r2, HIGH, воспроизведено в копии крейта): записи Welcome.secrets ничем не подписаны и ни к чему не
+// привязаны, OpenMLS берёт ПЕРВУЮ, для которой у меня есть KeyPackage (keys_for_welcome). r2 защищал КАЖДУЮ ссылку —
+// чужой Welcome, дописавший ссылки на собранные им мои KeyPackage, держал их все, и состояние росло на ~11 KP за
+// реконнект (дверь A-MLS-PRUNE). Теперь защищается ровно тот ключ, который этот Welcome съел бы при вступлении.
+
+/// Подделка ревьюера: к Welcome дописываются записи secrets из других Welcome (ссылки на другие мои KeyPackage).
+fn forge_with_extra_refs(base_wire: &[u8], extra_from: &[Vec<u8>]) -> Vec<u8> {
+    let w = welcome_of(base_wire).unwrap();
+    let mut v = serde_json::to_value(&w).unwrap();
+    for x in extra_from {
+        let xw = welcome_of(x).unwrap();
+        v["secrets"].as_array_mut().unwrap().push(serde_json::to_value(&xw.secrets()[0]).unwrap());
+    }
+    let forged: Welcome = serde_json::from_value(v).unwrap();
+    let mut wire = base_wire[..4].to_vec();
+    wire.extend(forged.tls_serialize_detached().unwrap());
+    wire
+}
+
+#[test]
+fn protect_forged_extra_refs_keep_only_the_consumed_key() {
+    let (alice, bob) = pinned_pair();
+    let gen1 = bob.rotate_key_packages(3, vec![]).unwrap();
+    let (wq, tq, gq) = pending_invite(&alice, gen1[0].clone());
+    let (wx, tx, _) = pending_invite(&alice, gen1[1].clone());
+    let forged = forge_with_extra_refs(&wq, &[wx.clone()]);
+    bob.stage_welcome(forged.clone(), tq.clone()).expect("подделка проходит stage — OpenMLS берёт первую свою запись");
+    for _ in 0..4 { bob.rotate_key_packages(3, vec![forged.clone()]).unwrap(); }
+    assert!(bob.join_from_welcome(wx, tx).is_err(), "🔴 чужая ссылка в Welcome НЕ держит другой мой KeyPackage");
+    assert_eq!(bob.join_from_welcome(forged, tq).unwrap(), gq, "🔴 ключ, который этот Welcome съест при «Принять», защищён");
+}
+
+#[test]
+fn protect_forged_refs_cannot_grow_storage() {
+    // Сценарий ревьюера: атакующий после каждой моей ротации собирает выданный пул и дописывает ссылки на все
+    // собранные KeyPackage в один и тот же карантинный Welcome. Размер обязан остаться в установившемся режиме.
+    let (alice, bob) = pinned_pair();
+    let lr = bob.make_last_resort_key_package().unwrap();
+    let (wq, tq, _) = pending_invite(&alice, lr.clone());
+    let base = bob.state_footprint().keys;
+    let mut collected: Vec<Vec<u8>> = vec![];
+    let mut forged = wq.clone();
+    let mut sizes = vec![];
+    for _ in 0..8 {
+        let pool = bob.rotate_key_packages(10, vec![forged.clone()]).unwrap();
+        bob.make_last_resort_key_package().unwrap();
+        for kp in pool { let (w, _, _) = pending_invite(&alice, kp); collected.push(w); }
+        forged = forge_with_extra_refs(&wq, &collected);
+        bob.stage_welcome(forged.clone(), tq.clone()).expect("подделка проходит stage");
+        sizes.push(bob.state_footprint().keys - base);
+    }
+    let last = *sizes.last().unwrap();
+    assert!(last <= 2 * 11 + 1, "🔴 подделанные ссылки не растят хранилище: над базой не больше двух поколений и записи, а было {:?}", sizes);
+}
+
+#[test]
+fn protect_set_is_capped() {
+    // Даже честные Welcome (по одному моему KeyPackage каждый) не держат больше MAX_PROTECTED_KEY_PACKAGES ключей:
+    // потолок — последняя граница против того, кто накопит у меня много карантинных групп.
+    let (alice, bob) = pinned_pair();
+    let n = crate::client::MAX_PROTECTED_KEY_PACKAGES + 6;
+    let pool = bob.rotate_key_packages(n as u32, vec![]).unwrap();
+    let ws: Vec<Vec<u8>> = pool.iter().map(|kp| pending_invite(&alice, kp.clone()).0).collect();
+    let base = bob.state_footprint().keys - n as u32; // без этого пула
+    for _ in 0..3 { bob.rotate_key_packages(1, ws.clone()).unwrap(); }
+    let held = bob.state_footprint().keys - base;
+    assert!(held <= crate::client::MAX_PROTECTED_KEY_PACKAGES as u32 + 2 * 1 + 1,
+        "🔴 защищённых ключей не больше потолка {} (+ два поколения по 1 KP + запись): над базой {}", crate::client::MAX_PROTECTED_KEY_PACKAGES, held);
+}
