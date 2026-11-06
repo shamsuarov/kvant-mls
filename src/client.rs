@@ -139,6 +139,20 @@ pub struct MemberDevice {
 }
 
 /// A1: Welcome из провода — EXHAUSTIVE MATCH по телу сообщения, без `_`: каждый тип тела назван.
+// KP-GEN-96 r2: ключи хранилища KeyPackage, на которые адресованы перечисленные Welcome (по KeyPackageRef из
+// открытой части — welcome.secrets()[i].new_member(), как own_key_packages_for в dispatch.rs). Мусор пропускается.
+fn protected_key_package_keys(storage: &crate::storage::KseStorageProvider, welcomes: &[Vec<u8>]) -> std::collections::HashSet<Vec<u8>> {
+    let mut out = std::collections::HashSet::new();
+    for w in welcomes {
+        let Ok(welcome) = welcome_of(w) else { continue };
+        for egs in welcome.secrets() {
+            let r = egs.new_member();
+            if let Ok(k) = storage.key_package_storage_key(&r) { out.insert(k); }
+        }
+    }
+    out
+}
+
 fn welcome_of(welcome_wire: &[u8]) -> Result<Welcome, MlsError> {
     let msg_in = MlsMessageIn::tls_deserialize_exact(welcome_wire).map_err(m)?;
     match msg_in.extract() {
@@ -607,8 +621,13 @@ impl MlsClient {
     /// поза-прошлое поколение может быть только тем, что пережил ДВА реконнекта, и его отказ —
     /// прежний знакомый класс `no-key-package`. Состояние ≤95 (без разметки): первая ротация
     /// ничего не снимает, вторая работает штатно.
-    pub fn rotate_key_packages(&self, count: u32) -> Result<Vec<Vec<u8>>, MlsError> {
+    ///
+    /// `protect_welcomes` (r2) — сырые Welcome (MlsMessage wire), которые приложение ещё держит: карантин A1
+    /// («Принять/Отклонить») и отложенные RETRY. KeyPackage, на которые они адресованы, не снимаются, пока их
+    /// перечисляют. Неразбираемые записи пропускаются — список собран из чужих байтов и ротацию не роняет.
+    pub fn rotate_key_packages(&self, count: u32, protect_welcomes: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>, MlsError> {
         let g = self.inner.lock().unwrap();
+        let protected = protected_key_package_keys(g.provider.storage(), &protect_welcomes);
         let before = g.provider.storage().key_package_keys();
         let mut out = Vec::with_capacity(count as usize);
         for _ in 0..count {
@@ -621,7 +640,7 @@ impl MlsClient {
         // Снимок взят ДО постройки, поэтому свежие ключи в него попасть не могли: из снимка снимается
         // ровно помеченное прежней ротацией, остальное помечается на следующую (порядок в HashMap
         // роли не играет). Разметка лежит в том же хранилище → переживает export/import.
-        let (dropped, kept) = g.provider.storage().retire_key_packages(&before).map_err(m)?;
+        let (dropped, kept) = g.provider.storage().retire_key_packages(&before, &protected).map_err(m)?;
         let _ = (dropped, kept);
         Ok(out)
     }

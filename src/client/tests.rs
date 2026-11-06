@@ -775,9 +775,9 @@ fn prune_shrinks_state_and_keeps_live_groups_working() {
     // ── ОБРЕЗКА 1: поколения пула ───────────────────────────────────────────────────────────
     // KP-GEN-96: первая ротация на неразмеченном состоянии ничего не снимает (всё, что есть,
     // становится «прежним» поколением), снимает — вторая. См. rotate_first_run_on_legacy_state_*.
-    let fresh = alice.rotate_key_packages(10).unwrap();
+    let fresh = alice.rotate_key_packages(10, vec![]).unwrap();
     assert_eq!(fresh.len(), 10, "новый пул выдан целиком");
-    let fresh = alice.rotate_key_packages(10).unwrap();
+    let fresh = alice.rotate_key_packages(10, vec![]).unwrap();
     assert_eq!(fresh.len(), 10, "второй новый пул выдан целиком");
     let (after_kp, _) = state_size(&alice);
     assert!(after_kp < fat_bytes, "ротация пула обязана уменьшить состояние: {fat_bytes} → {after_kp}");
@@ -1037,7 +1037,7 @@ fn rotate_keeps_exactly_one_previous_generation() {
     let (alice, bob) = pinned_pair();
 
     // Поколение 1 (как в приложении: пул ротацией + last-resort следом).
-    let gen1 = bob.rotate_key_packages(3).unwrap();
+    let gen1 = bob.rotate_key_packages(3, vec![]).unwrap();
     let lr1 = bob.make_last_resort_key_package().unwrap();
     // Три Welcome на поколение 1 выписаны и ЛЕЖАТ У СЕРВЕРА.
     let (w1a, t1a, g1a) = pending_invite(&alice, gen1[0].clone());
@@ -1045,13 +1045,13 @@ fn rotate_keeps_exactly_one_previous_generation() {
     let (wlr, tlr, glr) = pending_invite(&alice, lr1);
 
     // Реконнект → ротация (поколение 2). Поколение 1 обязано остаться целиком.
-    let gen2 = bob.rotate_key_packages(3).unwrap();
+    let gen2 = bob.rotate_key_packages(3, vec![]).unwrap();
     assert_eq!(bob.join_from_welcome(w1a, t1a).unwrap(), g1a, "🔴 Welcome на KP прежнего поколения открывается после ОДНОЙ ротации");
     assert_eq!(bob.join_from_welcome(wlr, tlr).unwrap(), glr, "🔴 last-resort прежнего поколения тоже жив после одной ротации");
     let (w2, t2, g2) = pending_invite(&alice, gen2[0].clone());
 
     // Ещё реконнект → ротация (поколение 3): поколение 1 снято, поколение 2 осталось.
-    let _gen3 = bob.rotate_key_packages(3).unwrap();
+    let _gen3 = bob.rotate_key_packages(3, vec![]).unwrap();
     assert!(bob.join_from_welcome(w1b, t1b).is_err(), "🔴 ровно ОДНО прежнее поколение: поза-прошлое снято");
     assert_eq!(bob.join_from_welcome(w2, t2).unwrap(), g2, "поколение 2 — прежнее для ротации 3 — живо");
 }
@@ -1059,22 +1059,26 @@ fn rotate_keeps_exactly_one_previous_generation() {
 #[test]
 fn rotate_generations_are_bounded_in_storage() {
     let (_alice, bob) = pinned_pair();
+    let base = bob.state_footprint().keys; // подпись и прочее служебное — до первого KeyPackage
     // Разогрев до установившегося режима, затем замер: дальнейшие ротации размер НЕ растят.
-    for _ in 0..3 { bob.rotate_key_packages(10).unwrap(); bob.make_last_resort_key_package().unwrap(); }
+    for _ in 0..3 { bob.rotate_key_packages(10, vec![]).unwrap(); bob.make_last_resort_key_package().unwrap(); }
     let steady = bob.state_footprint().keys;
-    for _ in 0..5 { bob.rotate_key_packages(10).unwrap(); bob.make_last_resort_key_package().unwrap(); }
+    for _ in 0..5 { bob.rotate_key_packages(10, vec![]).unwrap(); bob.make_last_resort_key_package().unwrap(); }
     assert_eq!(bob.state_footprint().keys, steady, "🔴 установившийся режим: ротация не копит поколения (ключей {steady})");
-    // И это именно ДВА поколения (пул 10 + last-resort), а не «всё что было»: < 3 поколений + служебные записи.
-    assert!(steady < 3 * 11 + 8, "в хранилище не больше двух поколений: ключей {steady}");
-    assert!(steady >= 2 * 11, "и не меньше двух (прежнее поколение хранится): ключей {steady}");
+    // РОВНО два поколения (пул 10 + last-resort каждое) + одна запись разметки KvantKpGeneration: три поколения
+    // дали бы +11, одно — −11, и ни то ни другое здесь не пройдёт.
+    assert_eq!(steady - base, 2 * 11 + 1, "🔴 в хранилище ровно два поколения KeyPackage и одна запись разметки (base {base}, steady {steady})");
 }
 
 #[test]
 fn rotate_previous_generation_survives_restart() {
+    // Ревью KP-GEN-96: прежняя редакция экспортировала состояние с ПУСТОЙ записью разметки — и проходила одинаково,
+    // переживает запись перезапуск или нет. Здесь запись к экспорту непуста: две ротации, gen1 помечено «прежним».
     let (alice, bob) = pinned_pair();
-    let gen1 = bob.rotate_key_packages(2).unwrap();
-    let (w1a, t1a, g1a) = pending_invite(&alice, gen1[0].clone());
-    let (w1b, t1b, _) = pending_invite(&alice, gen1[1].clone());
+    let gen1 = bob.rotate_key_packages(2, vec![]).unwrap();
+    let (w1, t1, _) = pending_invite(&alice, gen1[0].clone());
+    let gen2 = bob.rotate_key_packages(2, vec![]).unwrap(); // запись: прежнее = gen1
+    let (w2, t2, g2) = pending_invite(&alice, gen2[0].clone());
 
     // Перезапуск приложения: состояние экспортировано и поднято НОВЫМ клиентом той же личности.
     let blob = bob.export_state().unwrap();
@@ -1083,12 +1087,11 @@ fn rotate_previous_generation_survives_restart() {
     bob2.pin_account(a_id, a_pub);
     bob2.import_state(blob).unwrap();
 
-    // Первая ротация после перезапуска — поколение 1 становится «прежним» и остаётся.
-    bob2.rotate_key_packages(2).unwrap();
-    assert_eq!(bob2.join_from_welcome(w1a, t1a).unwrap(), g1a, "🔴 разметка поколений переживает перезапуск: Welcome на KP до перезапуска открывается");
-    // Вторая — снимает его.
-    bob2.rotate_key_packages(2).unwrap();
-    assert!(bob2.join_from_welcome(w1b, t1b).is_err(), "после двух ротаций поколение 1 снято и у перезапущенного клиента");
+    // Первая ротация после перезапуска снимает ровно gen1 — только если запись пережила импорт. Без записи она
+    // не сняла бы ничего (как на состоянии ≤95), и Welcome на gen1 открылся бы.
+    bob2.rotate_key_packages(2, vec![]).unwrap();
+    assert!(bob2.join_from_welcome(w1, t1).is_err(), "🔴 запись поколений пережила перезапуск: gen1 снято первой же ротацией после импорта");
+    assert_eq!(bob2.join_from_welcome(w2, t2).unwrap(), g2, "🔴 gen2 — прежнее для этой ротации — живо и после перезапуска");
 }
 
 #[test]
@@ -1100,9 +1103,76 @@ fn rotate_first_run_on_legacy_state_drops_nothing() {
     let (w, t, g) = pending_invite(&alice, old_pool[0].clone());
     let (w2, t2, _) = pending_invite(&alice, old_pool[1].clone());
     let before = bob.state_footprint().keys;
-    bob.rotate_key_packages(2).unwrap();
+    bob.rotate_key_packages(2, vec![]).unwrap();
     assert!(bob.state_footprint().keys > before, "первая ротация без разметки ничего не снимает");
     assert_eq!(bob.join_from_welcome(w, t).unwrap(), g, "🔴 Welcome на неразмеченное поколение открывается после первой ротации 96");
-    bob.rotate_key_packages(2).unwrap();
+    bob.rotate_key_packages(2, vec![]).unwrap();
     assert!(bob.join_from_welcome(w2, t2).is_err(), "вторая ротация снимает неразмеченное поколение");
+}
+
+// ═══ KP-GEN-96 r2: KeyPackage, на который ссылается известный приложению Welcome, ротация не снимает ═══════════
+//
+// ОТКУДА (ревью be54e3a, HIGH 3/3): Welcome в карантине A1 («Принять/Отклонить», буфер 'mlsw' до 7 суток) держит свой
+// одноразовый KeyPackage несожжённым до решения человека, и Welcome, отложенный RETRY, ждёт у сервера. Две ротации
+// (два реконнекта) снимали этот KeyPackage, и «Принять» кончалось NoMatchingKeyPackage. Источник правды «какие
+// Welcome ещё ждут» — приложение (буфер карантина, отложенные кадры); крейт получает их сырые байты на ротации и
+// не снимает KeyPackage, на которые они адресованы. Запись разметки при этом не врёт: защищённый ключ остаётся в
+// «прежнем» поколении и переоценивается на следующей ротации — перестали перечислять, снимется.
+
+#[test]
+fn rotate_keeps_key_package_of_protected_welcome() {
+    let (alice, bob) = pinned_pair();
+    let gen1 = bob.rotate_key_packages(3, vec![]).unwrap();
+    let (wq, tq, gq) = pending_invite(&alice, gen1[0].clone()); // ждёт «Принять»
+    let (wx, tx, _) = pending_invite(&alice, gen1[1].clone());  // никто не защищает — контроль
+    for _ in 0..4 { bob.rotate_key_packages(3, vec![wq.clone()]).unwrap(); }
+    assert!(bob.join_from_welcome(wx, tx).is_err(), "КОНТРОЛЬ: незащищённый KeyPackage gen1 снят за четыре ротации");
+    assert_eq!(bob.join_from_welcome(wq, tq).unwrap(), gq, "🔴 KeyPackage Welcome'а из списка защиты пережил четыре ротации");
+}
+
+#[test]
+fn rotate_keeps_key_package_of_staged_welcome_for_accept() {
+    // Ровно путь карантина A1: stage (KeyPackage остаётся на месте) → реконнекты → «Принять» = join от тех же байтов.
+    let (alice, bob) = pinned_pair();
+    let gen1 = bob.rotate_key_packages(2, vec![]).unwrap();
+    let (w, t, g) = pending_invite(&alice, gen1[0].clone());
+    bob.stage_welcome(w.clone(), t.clone()).unwrap();
+    for _ in 0..3 { bob.rotate_key_packages(2, vec![w.clone()]).unwrap(); }
+    assert_eq!(bob.join_from_welcome(w, t).unwrap(), g, "🔴 «Принять» после трёх реконнектов: KeyPackage карантинного Welcome цел");
+}
+
+#[test]
+fn rotate_protection_lapses_when_welcome_no_longer_listed() {
+    // Защита — не вечная метка в крейте: перестали перечислять (Отклонить/TTL/принят) — снимется по обычному правилу.
+    let (alice, bob) = pinned_pair();
+    let gen1 = bob.rotate_key_packages(2, vec![]).unwrap();
+    let (w, t, _) = pending_invite(&alice, gen1[0].clone());
+    for _ in 0..3 { bob.rotate_key_packages(2, vec![w.clone()]).unwrap(); }
+    bob.rotate_key_packages(2, vec![]).unwrap(); // защищённый ключ уже в «прежнем» — снимается первой же ротацией без защиты
+    assert!(bob.join_from_welcome(w, t).is_err(), "🔴 без защиты KeyPackage снимается: правило «два поколения» снова действует");
+}
+
+#[test]
+fn rotate_ignores_unparsable_protect_entries() {
+    // Список защиты собирается из чужих байтов (буфер карантина, отложенные кадры) — мусор в нём не роняет ротацию
+    // и ничего не защищает.
+    let (alice, bob) = pinned_pair();
+    let gen1 = bob.rotate_key_packages(2, vec![]).unwrap();
+    let (w, t, _) = pending_invite(&alice, gen1[0].clone());
+    let junk = vec![b"junk".to_vec(), vec![], gen1[1].clone() /* KeyPackage, не Welcome */];
+    for _ in 0..2 { assert_eq!(bob.rotate_key_packages(2, junk.clone()).unwrap().len(), 2, "ротация с мусором в списке защиты выдаёт пул"); }
+    assert!(bob.join_from_welcome(w, t).is_err(), "мусор ничего не защитил: gen1 снят за две ротации");
+}
+
+#[test]
+fn rotate_protection_does_not_grow_storage() {
+    // Защита не плодит записей: под постоянной защитой одного Welcome установившийся размер = два поколения + один
+    // защищённый KeyPackage + запись разметки.
+    let (alice, bob) = pinned_pair();
+    let base = bob.state_footprint().keys;
+    let gen1 = bob.rotate_key_packages(10, vec![]).unwrap();
+    bob.make_last_resort_key_package().unwrap();
+    let (w, _t, _) = pending_invite(&alice, gen1[0].clone());
+    for _ in 0..6 { bob.rotate_key_packages(10, vec![w.clone()]).unwrap(); bob.make_last_resort_key_package().unwrap(); }
+    assert_eq!(bob.state_footprint().keys - base, 2 * 11 + 1 + 1, "🔴 под защитой: два поколения + один защищённый KeyPackage + запись разметки");
 }

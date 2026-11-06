@@ -949,11 +949,24 @@ impl KseStorageProvider {
     // раньше), и всё из снимка, чего нет в записи, — это поколение, выросшее с прошлой ротации
     // (пул + last-resort + доливки): оно остаётся и становится новым содержимым записи.
     //
-    // Инварианты: (а) в хранилище не более двух поколений (установившийся режим — ровно два);
+    // r2 (ревью be54e3a): ЗАЩИЩЁННЫЕ ключи. KeyPackage, на который адресован ещё ждущий Welcome (карантин A1 —
+    // «Принять/Отклонить» до 7 суток; Welcome, отложенный RETRY у сервера), не снимается, даже если он в «прежнем»:
+    // он остаётся в записи и переоценивается на следующей ротации. Список защиты приходит от вызывающего на каждую
+    // ротацию (источник правды «что ещё ждёт» — приложение), своей вечной метки у крейта нет: перестали
+    // перечислять — ключ снимается по обычному правилу.
+    //
+    // Инварианты: (а) в хранилище не более двух поколений (установившийся режим — ровно два) плюс защищённые;
     // (б) Welcome, выписанный на KeyPackage, переживает один реконнект между выдачей KP и своим
     // приходом; (в) состояние ≤95 без записи: первая ротация ничего не снимает — консервативно.
     // Потреблённые OpenMLS записи (delete_key_package на join) в снимке отсутствуют и в расчёт
     // не попадают — ни снимать, ни хранить их не нужно.
+
+    /// Ключ хранилища, под которым лежит KeyPackage с этим hash_ref, — ровно тот, что строит write_key_package
+    /// (метка + serde_json(hash_ref)). Нужен, чтобы сопоставить Welcome (адресован по KeyPackageRef) со снимком
+    /// ключей ротации, не разбирая ни одного значения.
+    pub fn key_package_storage_key<R: traits::HashReference<CURRENT_VERSION>>(&self, hash_ref: &R) -> Result<Vec<u8>, KseStorageError> {
+        Ok(build_key(KEY_PACKAGE_LABEL, &serde_json::to_vec(hash_ref)?))
+    }
 
     /// Ключи KeyPackage, помеченные прежней ротацией как «снять на следующей». Пусто, если
     /// разметки ещё нет (состояние со сборки ≤95 или свежий клиент).
@@ -967,13 +980,13 @@ impl KseStorageProvider {
     }
 
     /// Завершить ротацию: `snapshot` — ключи KeyPackage, снятые ДО постройки нового пула. Снимает
-    /// из них ровно помеченные прежней ротацией, остальное (поколение с прошлой ротации) помечает
-    /// на следующую. Возвращает (снято, оставлено прежним поколением).
-    pub fn retire_key_packages(&self, snapshot: &[Vec<u8>]) -> Result<(u32, u32), KseStorageError> {
+    /// из них ровно помеченные прежней ротацией, кроме `protected`; остальное (поколение с прошлой ротации и
+    /// защищённые) помечает на следующую. Возвращает (снято, оставлено прежним поколением).
+    pub fn retire_key_packages(&self, snapshot: &[Vec<u8>], protected: &std::collections::HashSet<Vec<u8>>) -> Result<(u32, u32), KseStorageError> {
         let previous = self.kp_generation_previous()?;
         let previous: std::collections::HashSet<&Vec<u8>> = previous.iter().collect();
         let (stale, keep): (Vec<Vec<u8>>, Vec<Vec<u8>>) =
-            snapshot.iter().cloned().partition(|k| previous.contains(k));
+            snapshot.iter().cloned().partition(|k| previous.contains(k) && !protected.contains(k));
         let dropped = self.delete_keys(&stale);
         self.put(KP_GENERATION_LABEL, KP_GENERATION_KEY, serde_json::to_vec(&keep)?)?;
         Ok((dropped, keep.len() as u32))
